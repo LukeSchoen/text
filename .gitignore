@@ -1,0 +1,17 @@
+# Build outputs
+*.obj
+*.ilk
+*.pdb
+*.idb
+*.exp
+*.lib
+
+# Keep demo binary in repo
+!text.exe
+
+# VS / Windows
+.vs/
+*.user
+
+# OS
+Thumbs.db
