@@ -287,6 +287,8 @@ static void keep_caret_visible(App *app);
 
 static void update_title(App *app);
 
+static void update_scrollbars(App *app);
+
 static void position_caret(App *app);
 
 static void request_repaint(App *app, BOOL erase);
@@ -308,6 +310,8 @@ static void update_find_count_label(HWND hwnd);
 static void box_selection_bounds(const App *app, u64 *top, u64 *bottom, u64 *left, u64 *right);
 
 static bool doc_get_byte(Document *doc, u64 off, unsigned char *out);
+
+static void doc_discover_for_view(Document *doc, u64 first_line, u64 rows);
 
 /******************************************************************************
  * Caret Utilities
@@ -693,6 +697,44 @@ static int scroll_max_pos(const SCROLLINFO *si)
   int page = si->nPage > 0 ? (int)si->nPage : 1;
   int max_pos = si->nMax - page + 1;
   return max_pos > si->nMin ? max_pos : si->nMin;
+}
+
+static bool vscroll_can_line_up(const App *app)
+{
+  SCROLLINFO si;
+  int max_pos;
+  memset(&si, 0, sizeof(si));
+  si.cbSize = sizeof(si);
+  si.fMask = SIF_RANGE | SIF_PAGE;
+  if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
+  max_pos = scroll_max_pos(&si);
+  if (max_pos <= si.nMin) return false;
+  return app->tl > (u64)si.nMin;
+}
+
+static bool vscroll_can_line_down(App *app)
+{
+  SCROLLINFO si;
+  int max_pos;
+  memset(&si, 0, sizeof(si));
+  si.cbSize = sizeof(si);
+  si.fMask = SIF_RANGE | SIF_PAGE;
+  if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
+  max_pos = scroll_max_pos(&si);
+  if (max_pos <= si.nMin) return false;
+  if (app->tl < (u64)max_pos) return true;
+  if (!app->doc.lines.eof)
+  {
+    u64 budget_rows = (u64)(app->rows > 0 ? app->rows : 1);
+    doc_discover_for_view(&app->doc, app->tl + 1, budget_rows);
+    update_scrollbars(app);
+    memset(&si, 0, sizeof(si));
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE;
+    if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
+    max_pos = scroll_max_pos(&si);
+  }
+  return app->tl < (u64)max_pos;
 }
 
 static bool cursor_at_vscroll_bottom(HWND hwnd)
@@ -1784,6 +1826,177 @@ static bool apply_basic_edit(App *app, const char *insert_text, u64 insert_len, 
   return changed;
 }
 
+static bool apply_box_paste_multiline(App *app, const char *insert_text, u64 insert_len)
+{
+  u64 top, bottom, left, right;
+  u64 seg_count = 1;
+  const char **seg_ptrs = NULL;
+  u64 *seg_lens = NULL;
+  bool changed = false;
+  if (!has_box_selection(app) || !insert_text || insert_len == 0) return false;
+  box_selection_bounds(app, &top, &bottom, &left, &right);
+  for (u64 i = 0; i < insert_len; ++i)
+    if (insert_text[i] == '\n')
+      seg_count++;
+  if (seg_count <= 1) return apply_basic_edit(app, insert_text, insert_len, false, false);
+
+  seg_ptrs = (const char **)malloc(sizeof(*seg_ptrs) * (size_t)seg_count);
+  seg_lens = (u64 *)malloc(sizeof(*seg_lens) * (size_t)seg_count);
+  if (!seg_ptrs || !seg_lens)
+  {
+    free(seg_ptrs);
+    free(seg_lens);
+    return false;
+  }
+
+  {
+    u64 seg_i = 0;
+    u64 start = 0;
+    for (u64 i = 0; i <= insert_len; ++i)
+    {
+      if (i == insert_len || insert_text[i] == '\n')
+      {
+        u64 len = i - start;
+        if (len > 0 && insert_text[start + len - 1] == '\r') len--;
+        seg_ptrs[seg_i] = insert_text + start;
+        seg_lens[seg_i] = len;
+        seg_i++;
+        start = i + 1;
+      }
+    }
+  }
+
+  begin_edit_txn(app);
+  for (u64 line = bottom + 1; line-- > top;)
+  {
+    u64 ls = doc_line_start(&app->doc, line);
+    u64 le = doc_line_length_clamped(&app->doc, ls, UINT32_MAX);
+    u64 ll = le - ls;
+    u64 del_col_start = left;
+    u64 del_col_end = right;
+    u64 seg_index = line - top;
+    if (seg_index >= seg_count) seg_index = seg_count - 1;
+    if (del_col_start < ll)
+    {
+      u64 del_start = ls + del_col_start;
+      u64 del_to = min_u64(del_col_end, ll);
+      if (del_to > del_col_start)
+      {
+        app_doc_delete(app, del_start, del_to - del_col_start);
+        ll -= (del_to - del_col_start);
+        changed = true;
+      }
+    }
+    if (seg_lens[seg_index] > 0)
+    {
+      if (ll < left)
+      {
+        if (!app_insert_spaces(app, ls + ll, left - ll))
+          continue;
+        changed = true;
+      }
+      if (app_doc_insert(app, ls + left, seg_ptrs[seg_index], seg_lens[seg_index]))
+        changed = true;
+    }
+  }
+  if (changed)
+  {
+    u64 active_seg = app->bcl >= top ? app->bcl - top : 0;
+    if (active_seg >= seg_count) active_seg = seg_count - 1;
+    update_title(app);
+    doc_ensure_line(&app->doc, bottom);
+    app->bac = left + seg_lens[0];
+    app->bcc = left + seg_lens[active_seg];
+    app->bdc = app->bcc;
+    set_caret_line_col(app, app->bcl, app->bdc);
+  }
+  end_edit_txn(app);
+  free(seg_ptrs);
+  free(seg_lens);
+  return changed;
+}
+
+static bool apply_caret_multiline_paste(App *app, const char *insert_text, u64 insert_len)
+{
+  u64 seg_count = 1;
+  const char **seg_ptrs = NULL;
+  u64 *seg_lens = NULL;
+  bool changed = false;
+  u64 base_line;
+  u64 base_col;
+  if (!insert_text || insert_len == 0) return false;
+  for (u64 i = 0; i < insert_len; ++i)
+    if (insert_text[i] == '\n')
+      seg_count++;
+  if (seg_count <= 1) return false;
+
+  seg_ptrs = (const char **)malloc(sizeof(*seg_ptrs) * (size_t)seg_count);
+  seg_lens = (u64 *)malloc(sizeof(*seg_lens) * (size_t)seg_count);
+  if (!seg_ptrs || !seg_lens)
+  {
+    free(seg_ptrs);
+    free(seg_lens);
+    return false;
+  }
+
+  {
+    u64 seg_i = 0;
+    u64 start = 0;
+    for (u64 i = 0; i <= insert_len; ++i)
+    {
+      if (i == insert_len || insert_text[i] == '\n')
+      {
+        u64 len = i - start;
+        if (len > 0 && insert_text[start + len - 1] == '\r') len--;
+        seg_ptrs[seg_i] = insert_text + start;
+        seg_lens[seg_i] = len;
+        seg_i++;
+        start = i + 1;
+      }
+    }
+  }
+
+  base_line = app->cl;
+  base_col = app->cc;
+
+  doc_ensure_line(&app->doc, base_line);
+  while (app->doc.lines.count <= base_line + seg_count - 1)
+  {
+    if (!app_doc_insert(app, app->doc.len, "\n", 1))
+      break;
+    changed = true;
+    doc_ensure_line(&app->doc, base_line + seg_count - 1);
+  }
+
+  for (u64 seg_index = seg_count; seg_index-- > 0;)
+  {
+    u64 line = base_line + seg_index;
+    u64 ls = doc_line_start(&app->doc, line);
+    u64 le = doc_line_length_clamped(&app->doc, ls, UINT32_MAX);
+    u64 ll = le - ls;
+    if (ll < base_col)
+    {
+      if (!app_insert_spaces(app, ls + ll, base_col - ll))
+        continue;
+      changed = true;
+    }
+    if (seg_lens[seg_index] > 0)
+    {
+      if (app_doc_insert(app, ls + base_col, seg_ptrs[seg_index], seg_lens[seg_index]))
+        changed = true;
+    }
+  }
+
+  if (changed)
+  {
+    update_title(app);
+    set_caret_line_col(app, base_line, base_col + seg_lens[0]);
+  }
+  free(seg_ptrs);
+  free(seg_lens);
+  return changed;
+}
+
 static bool extend_box_selection(App *app, WPARAM key)
 {
   u64 line;
@@ -2096,7 +2309,7 @@ static void paint_editor(App *app, HDC dc)
             vis_start = (int)(left > app->fc ? left - app->fc : 0);
             vis_end = (int)(right - app->fc);
             if (vis_start < 0) vis_start = 0;
-            if (vis_end > n) vis_end = n;
+            if (vis_end > max_cols) vis_end = max_cols;
             if (vis_end > vis_start)
             {
               RECT sel_rc;
@@ -2105,9 +2318,17 @@ static void paint_editor(App *app, HDC dc)
               sel_rc.top = y;
               sel_rc.bottom = y + app->line_h;
               FillRect(dc, &sel_rc, selection_brush);
-              SetTextColor(dc, THEME_SELECTION_TEXT);
-              TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, vis_end - vis_start);
-              SetTextColor(dc, THEME_TEXT);
+              if (vis_start < n)
+              {
+                int text_vis_end = vis_end;
+                if (text_vis_end > n) text_vis_end = n;
+                if (text_vis_end > vis_start)
+                {
+                  SetTextColor(dc, THEME_SELECTION_TEXT);
+                  TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, text_vis_end - vis_start);
+                  SetTextColor(dc, THEME_TEXT);
+                }
+              }
             }
           }
         }
@@ -2483,91 +2704,388 @@ static bool current_line_range(App *app, u64 *out_start, u64 *out_end)
 static bool move_caret_line_by_swap(App *app, bool move_down)
 {
   u64 line_count;
-  u64 src_line;
-  u64 dst_line;
-  u64 upper_line;
-  u64 lower_line;
-  u64 upper_start;
-  u64 upper_text_end;
-  u64 lower_start;
-  u64 lower_text_end;
-  u64 after_lower_start;
-  u64 upper_text_len;
-  u64 between_sep_len;
-  u64 lower_text_len;
-  u64 lower_sep_len;
-  u64 block_len;
-  u64 swapped_len;
+  u64 move_start_line;
+  u64 move_end_line;
+  u64 move_start_off;
+  u64 move_end_off;
+  u64 neighbor_start_off;
+  u64 neighbor_end_off;
+  u64 region_start_off;
+  u64 region_len;
+  u64 moved_block_len;
+  u64 neighbor_len;
+  u64 move_end_line_start;
+  u64 move_end_text_end;
+  u64 trailing_sep_len;
+  u64 neighbor_text_end;
+  u64 neighbor_trailing_sep_len;
+  int64_t shift;
+  u64 old_co;
+  u64 old_sa;
+  u64 old_sv;
   char *swapped_buf;
-  CopyCtx copy_upper_text;
-  CopyCtx copy_between_sep;
-  CopyCtx copy_lower_text;
-  CopyCtx copy_lower_sep;
+  CopyCtx copy_first;
+  CopyCtx copy_second;
   bool changed = false;
-  u64 old_col;
+  u64 sel_lo;
+  u64 sel_hi;
+  u64 sel_hi_minus_one;
+  u64 tmp_line;
+  u64 tmp_col;
   doc_discover_all_lines(&app->doc);
   line_count = app->doc.lines.count ? app->doc.lines.count : 1;
   if (line_count <= 1) return false;
-  src_line = app->cl;
-  if ((!move_down && src_line == 0) || (move_down && src_line + 1 >= line_count)) return false;
-  dst_line = move_down ? (src_line + 1) : (src_line - 1);
-  upper_line = move_down ? src_line : dst_line;
-  lower_line = move_down ? dst_line : src_line;
-  upper_start = doc_line_start(&app->doc, upper_line);
-  lower_start = doc_line_start(&app->doc, lower_line);
-  if (upper_start > app->doc.len || lower_start > app->doc.len || lower_start < upper_start) return false;
-  upper_text_end = doc_line_length_clamped(&app->doc, upper_start, UINT32_MAX);
-  lower_text_end = doc_line_length_clamped(&app->doc, lower_start, UINT32_MAX);
-  if (upper_text_end < upper_start || lower_text_end < lower_start) return false;
-  if (lower_line + 1 < line_count)
+  if (has_box_selection(app))
   {
-    after_lower_start = doc_line_start(&app->doc, lower_line + 1);
-    if (after_lower_start < lower_start || after_lower_start > app->doc.len) return false;
+    u64 top, bottom, left, right;
+    u64 old_bal, old_bac, old_bcl, old_bcc, old_bdc;
+    u64 old_sa, old_sv;
+    u64 line;
+    u64 max_line = line_count - 1;
+    box_selection_bounds(app, &top, &bottom, &left, &right);
+    if ((!move_down && top == 0) || (move_down && bottom >= max_line)) return false;
+    old_bal = app->bal;
+    old_bac = app->bac;
+    old_bcl = app->bcl;
+    old_bcc = app->bcc;
+    old_bdc = app->bdc;
+    old_sa = app->sa;
+    old_sv = app->sv;
+    clear_box_selection(app);
+    clear_stream_selection(app);
+    if (move_down)
+    {
+      line = bottom + 1;
+      while (line > top)
+      {
+        line--;
+        set_caret_line_col(app, line, old_bdc);
+        if (!move_caret_line_by_swap(app, true))
+        {
+          app->sa = old_sa;
+          app->sv = old_sv;
+          return false;
+        }
+      }
+      app->bal = min_u64(old_bal + 1, max_line);
+      app->bcl = min_u64(old_bcl + 1, max_line);
+    }
+    else
+    {
+      for (line = top; line <= bottom; ++line)
+      {
+        set_caret_line_col(app, line, old_bdc);
+        if (!move_caret_line_by_swap(app, false))
+        {
+          app->sa = old_sa;
+          app->sv = old_sv;
+          return false;
+        }
+      }
+      app->bal = old_bal > 0 ? old_bal - 1 : 0;
+      app->bcl = old_bcl > 0 ? old_bcl - 1 : 0;
+    }
+    app->bsa = true;
+    app->bac = old_bac;
+    app->bcc = old_bcc;
+    app->bdc = old_bdc;
+    app->sa = old_sa;
+    app->sv = old_sv;
+    set_caret_line_col(app, app->bcl, app->bdc);
+    return true;
+  }
+  if (!has_stream_selection(app))
+  {
+    u64 src_line = app->cl;
+    u64 dst_line;
+    u64 upper_line;
+    u64 lower_line;
+    u64 upper_start;
+    u64 upper_text_end;
+    u64 lower_start;
+    u64 lower_text_end;
+    u64 after_lower_start;
+    u64 upper_text_len;
+    u64 between_sep_len;
+    u64 lower_text_len;
+    u64 lower_sep_len;
+    u64 block_len;
+    u64 swapped_len;
+    u64 old_col;
+    CopyCtx copy_upper_text;
+    CopyCtx copy_between_sep;
+    CopyCtx copy_lower_text;
+    CopyCtx copy_lower_sep;
+    if ((!move_down && src_line == 0) || (move_down && src_line + 1 >= line_count)) return false;
+    dst_line = move_down ? (src_line + 1) : (src_line - 1);
+    upper_line = move_down ? src_line : dst_line;
+    lower_line = move_down ? dst_line : src_line;
+    upper_start = doc_line_start(&app->doc, upper_line);
+    lower_start = doc_line_start(&app->doc, lower_line);
+    if (upper_start > app->doc.len || lower_start > app->doc.len || lower_start < upper_start) return false;
+    upper_text_end = doc_line_length_clamped(&app->doc, upper_start, UINT32_MAX);
+    lower_text_end = doc_line_length_clamped(&app->doc, lower_start, UINT32_MAX);
+    if (upper_text_end < upper_start || lower_text_end < lower_start) return false;
+    if (lower_line + 1 < line_count)
+    {
+      after_lower_start = doc_line_start(&app->doc, lower_line + 1);
+      if (after_lower_start < lower_start || after_lower_start > app->doc.len) return false;
+    }
+    else
+      after_lower_start = app->doc.len;
+    upper_text_len = upper_text_end - upper_start;
+    between_sep_len = lower_start - upper_text_end;
+    lower_text_len = lower_text_end - lower_start;
+    lower_sep_len = after_lower_start - lower_text_end;
+    block_len = after_lower_start - upper_start;
+    swapped_len = lower_text_len + between_sep_len + upper_text_len + lower_sep_len;
+    if (swapped_len != block_len) return false;
+    swapped_buf = (char *)calloc((size_t)swapped_len, 1);
+    if (!swapped_buf && swapped_len != 0) return false;
+    copy_lower_text.dst = swapped_buf;
+    copy_lower_text.at = 0;
+    if (lower_text_len > 0) doc_read_range(&app->doc, lower_start, lower_text_len, copy_span, &copy_lower_text);
+    copy_between_sep.dst = swapped_buf + copy_lower_text.at;
+    copy_between_sep.at = 0;
+    if (between_sep_len > 0) doc_read_range(&app->doc, upper_text_end, between_sep_len, copy_span, &copy_between_sep);
+    copy_upper_text.dst = swapped_buf + copy_lower_text.at + copy_between_sep.at;
+    copy_upper_text.at = 0;
+    if (upper_text_len > 0) doc_read_range(&app->doc, upper_start, upper_text_len, copy_span, &copy_upper_text);
+    copy_lower_sep.dst = swapped_buf + copy_lower_text.at + copy_between_sep.at + copy_upper_text.at;
+    copy_lower_sep.at = 0;
+    if (lower_sep_len > 0) doc_read_range(&app->doc, lower_text_end, lower_sep_len, copy_span, &copy_lower_sep);
+    if (copy_lower_text.at != lower_text_len ||
+        copy_between_sep.at != between_sep_len ||
+        copy_upper_text.at != upper_text_len ||
+        copy_lower_sep.at != lower_sep_len)
+    {
+      free(swapped_buf);
+      return false;
+    }
+    begin_edit_txn(app);
+    if (!app_doc_delete(app, upper_start, block_len) ||
+        (swapped_len > 0 && !app_doc_insert(app, upper_start, swapped_buf, swapped_len)))
+    {
+      end_edit_txn(app);
+      free(swapped_buf);
+      return false;
+    }
+    end_edit_txn(app);
+    changed = true;
+    old_col = app->cc;
+    set_caret_line_col(app, dst_line, old_col);
+    clear_stream_selection(app);
+    clear_box_selection(app);
+    free(swapped_buf);
+    return changed;
+  }
+  move_start_line = app->cl;
+  move_end_line = app->cl;
+  if (has_stream_selection(app))
+  {
+    sel_lo = min_u64(app->sa, app->sv);
+    sel_hi = max_u64(app->sa, app->sv);
+    if (sel_hi > sel_lo)
+    {
+      doc_offset_to_line_col(&app->doc, sel_lo, &move_start_line, &tmp_col);
+      sel_hi_minus_one = sel_hi - 1;
+      doc_offset_to_line_col(&app->doc, sel_hi_minus_one, &move_end_line, &tmp_col);
+      if (move_end_line < move_start_line)
+      {
+        tmp_line = move_start_line;
+        move_start_line = move_end_line;
+        move_end_line = tmp_line;
+      }
+    }
+  }
+  if ((!move_down && move_start_line == 0) || (move_down && move_end_line + 1 >= line_count)) return false;
+  {
+    u64 neighbor_line = move_down ? (move_end_line + 1) : (move_start_line - 1);
+    u64 neighbor_start = doc_line_start(&app->doc, neighbor_line);
+    u64 neighbor_end = (neighbor_line + 1 < line_count) ? doc_line_start(&app->doc, neighbor_line + 1) : app->doc.len;
+    int64_t sel_shift = move_down
+      ? (int64_t)(neighbor_end - neighbor_start)
+      : -((int64_t)(neighbor_end - neighbor_start));
+    u64 old_sel_a = app->sa;
+    u64 old_sel_v = app->sv;
+    u64 old_co_stream = app->co;
+    u64 old_col_stream = app->cc;
+    u64 line = 0;
+    bool ok = true;
+    clear_stream_selection(app);
+    clear_box_selection(app);
+    if (move_down)
+    {
+      line = move_end_line + 1;
+      while (line > move_start_line)
+      {
+        line--;
+        set_caret_line_col(app, line, old_col_stream);
+        if (!move_caret_line_by_swap(app, true))
+        {
+          ok = false;
+          break;
+        }
+      }
+    }
+    else
+    {
+      line = move_start_line;
+      while (line <= move_end_line)
+      {
+        set_caret_line_col(app, line, old_col_stream);
+        if (!move_caret_line_by_swap(app, false))
+        {
+          ok = false;
+          break;
+        }
+        line++;
+      }
+    }
+    if (!ok) return false;
+    if (sel_shift >= 0)
+    {
+      u64 d = (u64)sel_shift;
+      app->sa = min_u64(old_sel_a + d, app->doc.len);
+      app->sv = min_u64(old_sel_v + d, app->doc.len);
+      app->co = min_u64(old_co_stream + d, app->doc.len);
+    }
+    else
+    {
+      u64 d = (u64)(-sel_shift);
+      app->sa = old_sel_a > d ? old_sel_a - d : 0;
+      app->sv = old_sel_v > d ? old_sel_v - d : 0;
+      app->co = old_co_stream > d ? old_co_stream - d : 0;
+    }
+    sync_caret_from_offsets(app);
+    clear_box_selection(app);
+    return true;
+  }
+  move_start_off = doc_line_start(&app->doc, move_start_line);
+  if (move_end_line + 1 < line_count)
+    move_end_off = doc_line_start(&app->doc, move_end_line + 1);
+  else
+    move_end_off = app->doc.len;
+  if (move_end_off < move_start_off || move_end_off > app->doc.len) return false;
+  moved_block_len = move_end_off - move_start_off;
+  if (move_down)
+  {
+    neighbor_start_off = move_end_off;
+    if (move_end_line + 2 < line_count)
+      neighbor_end_off = doc_line_start(&app->doc, move_end_line + 2);
+    else
+      neighbor_end_off = app->doc.len;
+    region_start_off = move_start_off;
+    shift = (int64_t)(neighbor_end_off - neighbor_start_off);
   }
   else
-    after_lower_start = app->doc.len;
-  upper_text_len = upper_text_end - upper_start;
-  between_sep_len = lower_start - upper_text_end;
-  lower_text_len = lower_text_end - lower_start;
-  lower_sep_len = after_lower_start - lower_text_end;
-  block_len = after_lower_start - upper_start;
-  swapped_len = lower_text_len + between_sep_len + upper_text_len + lower_sep_len;
-  if (swapped_len != block_len) return false;
-  swapped_buf = (char *)calloc((size_t)swapped_len, 1);
-  if (!swapped_buf && swapped_len != 0) return false;
-  copy_lower_text.dst = swapped_buf;
-  copy_lower_text.at = 0;
-  if (lower_text_len > 0) doc_read_range(&app->doc, lower_start, lower_text_len, copy_span, &copy_lower_text);
-  copy_between_sep.dst = swapped_buf + copy_lower_text.at;
-  copy_between_sep.at = 0;
-  if (between_sep_len > 0) doc_read_range(&app->doc, upper_text_end, between_sep_len, copy_span, &copy_between_sep);
-  copy_upper_text.dst = swapped_buf + copy_lower_text.at + copy_between_sep.at;
-  copy_upper_text.at = 0;
-  if (upper_text_len > 0) doc_read_range(&app->doc, upper_start, upper_text_len, copy_span, &copy_upper_text);
-  copy_lower_sep.dst = swapped_buf + copy_lower_text.at + copy_between_sep.at + copy_upper_text.at;
-  copy_lower_sep.at = 0;
-  if (lower_sep_len > 0) doc_read_range(&app->doc, lower_text_end, lower_sep_len, copy_span, &copy_lower_sep);
-  if (copy_lower_text.at != lower_text_len ||
-      copy_between_sep.at != between_sep_len ||
-      copy_upper_text.at != upper_text_len ||
-      copy_lower_sep.at != lower_sep_len)
   {
-    free(swapped_buf);
-    return false;
+    neighbor_start_off = doc_line_start(&app->doc, move_start_line - 1);
+    neighbor_end_off = move_start_off;
+    region_start_off = neighbor_start_off;
+    shift = -((int64_t)(neighbor_end_off - neighbor_start_off));
   }
+  if (neighbor_end_off < neighbor_start_off || neighbor_end_off > app->doc.len) return false;
+  neighbor_len = neighbor_end_off - neighbor_start_off;
+  region_len = moved_block_len + neighbor_len;
+  if (move_down && neighbor_len == 0 && move_end_line + 1 == line_count - 1 && moved_block_len > 0)
+  {
+    move_end_line_start = doc_line_start(&app->doc, move_end_line);
+    move_end_text_end = doc_line_length_clamped(&app->doc, move_end_line_start, UINT32_MAX);
+    trailing_sep_len = move_end_off - move_end_text_end;
+    if (trailing_sep_len == 0 || trailing_sep_len > moved_block_len) return false;
+    swapped_buf = (char *)calloc((size_t)region_len, 1);
+    if (!swapped_buf) return false;
+    copy_first.dst = swapped_buf;
+    copy_first.at = 0;
+    copy_second.dst = swapped_buf + (size_t)trailing_sep_len;
+    copy_second.at = 0;
+    doc_read_range(&app->doc, move_end_text_end, trailing_sep_len, copy_span, &copy_first);
+    doc_read_range(&app->doc, move_start_off, moved_block_len - trailing_sep_len, copy_span, &copy_second);
+    if (copy_first.at != trailing_sep_len || copy_second.at != moved_block_len - trailing_sep_len)
+    {
+      free(swapped_buf);
+      return false;
+    }
+    shift = (int64_t)trailing_sep_len;
+    goto perform_swap;
+  }
+  if (!move_down && moved_block_len == 0 && move_start_line == line_count - 1 && neighbor_len > 0)
+  {
+    neighbor_text_end = doc_line_length_clamped(&app->doc, neighbor_start_off, UINT32_MAX);
+    neighbor_trailing_sep_len = neighbor_end_off - neighbor_text_end;
+    if (neighbor_trailing_sep_len == 0 || neighbor_trailing_sep_len > neighbor_len) return false;
+    swapped_buf = (char *)calloc((size_t)region_len, 1);
+    if (!swapped_buf) return false;
+    copy_first.dst = swapped_buf;
+    copy_first.at = 0;
+    copy_second.dst = swapped_buf + (size_t)neighbor_trailing_sep_len;
+    copy_second.at = 0;
+    doc_read_range(&app->doc, neighbor_text_end, neighbor_trailing_sep_len, copy_span, &copy_first);
+    doc_read_range(&app->doc, neighbor_start_off, neighbor_len - neighbor_trailing_sep_len, copy_span, &copy_second);
+    if (copy_first.at != neighbor_trailing_sep_len || copy_second.at != neighbor_len - neighbor_trailing_sep_len)
+    {
+      free(swapped_buf);
+      return false;
+    }
+    shift = -((int64_t)(neighbor_len - neighbor_trailing_sep_len));
+    goto perform_swap;
+  }
+  swapped_buf = (char *)calloc((size_t)region_len, 1);
+  if (!swapped_buf && region_len != 0) return false;
+  copy_first.dst = swapped_buf;
+  copy_first.at = 0;
+  copy_second.dst = swapped_buf + (size_t)(move_down ? neighbor_len : moved_block_len);
+  copy_second.at = 0;
+  if (move_down)
+  {
+    if (neighbor_len > 0) doc_read_range(&app->doc, neighbor_start_off, neighbor_len, copy_span, &copy_first);
+    if (moved_block_len > 0) doc_read_range(&app->doc, move_start_off, moved_block_len, copy_span, &copy_second);
+    if (copy_first.at != neighbor_len || copy_second.at != moved_block_len)
+    {
+      free(swapped_buf);
+      return false;
+    }
+  }
+  else
+  {
+    if (moved_block_len > 0) doc_read_range(&app->doc, move_start_off, moved_block_len, copy_span, &copy_first);
+    if (neighbor_len > 0) doc_read_range(&app->doc, neighbor_start_off, neighbor_len, copy_span, &copy_second);
+    if (copy_first.at != moved_block_len || copy_second.at != neighbor_len)
+    {
+      free(swapped_buf);
+      return false;
+    }
+  }
+perform_swap:
+  old_co = app->co;
+  old_sa = app->sa;
+  old_sv = app->sv;
   begin_edit_txn(app);
-  if (!app_doc_delete(app, upper_start, block_len) ||
-      (swapped_len > 0 && !app_doc_insert(app, upper_start, swapped_buf, swapped_len)))
+  if (!app_doc_delete(app, region_start_off, region_len) ||
+      (region_len > 0 && !app_doc_insert(app, region_start_off, swapped_buf, region_len)))
   {
     end_edit_txn(app);
     free(swapped_buf);
     return false;
   }
+  if (shift >= 0)
+  {
+    u64 d = (u64)shift;
+    app->co = min_u64(old_co + d, app->doc.len);
+    app->sa = min_u64(old_sa + d, app->doc.len);
+    app->sv = min_u64(old_sv + d, app->doc.len);
+  }
+  else
+  {
+    u64 d = (u64)(-shift);
+    app->co = old_co > d ? old_co - d : 0;
+    app->sa = old_sa > d ? old_sa - d : 0;
+    app->sv = old_sv > d ? old_sv - d : 0;
+  }
+  sync_caret_from_offsets(app);
   end_edit_txn(app);
   changed = true;
-  old_col = app->cc;
-  set_caret_line_col(app, dst_line, old_col);
-  clear_stream_selection(app);
   clear_box_selection(app);
   free(swapped_buf);
   return changed;
@@ -2587,6 +3105,31 @@ static void copy_current_line_to_clipboard(App *app)
 
 static void save_dialog(App *app)
 {
+  if (app->doc.path[0])
+  {
+    doc_save(&app->doc, app->doc.path);
+    update_title(app);
+    return;
+  }
+  WCHAR path[MAX_PATH];
+  lstrcpynW(path, L"untitled.txt", MAX_PATH);
+  OPENFILENAMEW ofn;
+  memset(&ofn, 0, sizeof(ofn));
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = app->hwnd;
+  ofn.lpstrFile = path;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.lpstrFilter = L"Text\0*.txt\0All\0*.*\0";
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+  if (GetSaveFileNameW(&ofn))
+  {
+    doc_save(&app->doc, path);
+    update_title(app);
+  }
+}
+
+static void save_as_dialog(App *app)
+{
   WCHAR path[MAX_PATH];
   lstrcpynW(path, app->doc.path[0] ? app->doc.path : L"untitled.txt", MAX_PATH);
   OPENFILENAMEW ofn;
@@ -2597,7 +3140,7 @@ static void save_dialog(App *app)
   ofn.nMaxFile = MAX_PATH;
   ofn.lpstrFilter = L"Text\0*.txt\0All\0*.*\0";
   ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-  if (app->doc.path[0] || GetSaveFileNameW(&ofn))
+  if (GetSaveFileNameW(&ofn))
   {
     doc_save(&app->doc, path);
     update_title(app);
@@ -2623,7 +3166,7 @@ static void paste_clipboard(App *app)
           WideCharToMultiByte(CP_UTF8, 0, w, -1, utf8, bytes, NULL, NULL);
           begin_edit_txn(app);
           if (has_box_selection(app))
-            apply_basic_edit(app, utf8, (u64)bytes - 1, false, false);
+            apply_box_paste_multiline(app, utf8, (u64)bytes - 1);
           else
           {
             bool line_paste = app->clm && !has_stream_selection(app);
@@ -2631,36 +3174,42 @@ static void paste_clipboard(App *app)
             u64 old_line = app->cl;
             u64 old_col = app->cc;
             u64 pasted_newlines = 0;
+            bool did_caret_multiline = false;
             if (has_stream_selection(app)) delete_selection(app);
-            u64 off = line_paste ? doc_line_start(&app->doc, app->cl) : app->co;
-            app_doc_insert(app, off, utf8, inserted_len);
-            app->co = off + inserted_len;
-            for (int i = 0; i < bytes - 1; ++i)
+            if (!line_paste && !has_stream_selection(app))
+              did_caret_multiline = apply_caret_multiline_paste(app, utf8, inserted_len);
+            if (!did_caret_multiline)
             {
-              if (utf8[i] == '\n')
+              u64 off = line_paste ? doc_line_start(&app->doc, app->cl) : app->co;
+              app_doc_insert(app, off, utf8, inserted_len);
+              app->co = off + inserted_len;
+              for (int i = 0; i < bytes - 1; ++i)
               {
-                pasted_newlines++;
-                app->cl++;
-                app->cc = 0;
+                if (utf8[i] == '\n')
+                {
+                  pasted_newlines++;
+                  app->cl++;
+                  app->cc = 0;
+                }
+                else if (utf8[i] != '\r')
+                  app->cc++;
               }
-              else if (utf8[i] != '\r')
-                app->cc++;
-            }
-            if (line_paste && inserted_len > 0)
-            {
-              u64 trim = 0;
-              if (inserted_len >= 2 &&
-                  utf8[inserted_len - 2] == '\r' &&
-                  utf8[inserted_len - 1] == '\n')
-                trim = 2;
-              else if (utf8[inserted_len - 1] == '\r' || utf8[inserted_len - 1] == '\n')
-                trim = 1;
-              if (trim > 0 && app->co >= trim)
+              if (line_paste && inserted_len > 0)
               {
-                app->co -= trim;
-                sync_caret_from_offsets(app);
+                u64 trim = 0;
+                if (inserted_len >= 2 &&
+                    utf8[inserted_len - 2] == '\r' &&
+                    utf8[inserted_len - 1] == '\n')
+                  trim = 2;
+                else if (utf8[inserted_len - 1] == '\r' || utf8[inserted_len - 1] == '\n')
+                  trim = 1;
+                if (trim > 0 && app->co >= trim)
+                {
+                  app->co -= trim;
+                  sync_caret_from_offsets(app);
+                }
+                set_caret_line_col(app, old_line + pasted_newlines, old_col);
               }
-              set_caret_line_col(app, old_line + pasted_newlines, old_col);
             }
           }
           end_edit_txn(app);
@@ -2968,7 +3517,8 @@ static void handle_key(App *app, WPARAM vk)
     return;
   }
   if (ctrl && vk == 'O') { open_dialog(app); return; }
-  if (ctrl && vk == 'S') { save_dialog(app); return; }
+  if (ctrl && !shift && vk == 'S') { save_dialog(app); return; }
+  if (ctrl && shift && vk == 'S') { save_as_dialog(app); return; }
   if (ctrl && vk == 'C')
   {
     if (has_box_selection(app))
@@ -3049,7 +3599,15 @@ static void handle_key(App *app, WPARAM vk)
   }
   if (ctrl && !shift && vk == 'Z') { perform_undo(app); return; }
   if ((ctrl && !shift && vk == 'Y') || (ctrl && shift && vk == 'Z')) { perform_redo(app); return; }
-  if (ctrl && shift && vk == 'D') { run_codex_do_command(app); return; }
+  if (ctrl && alt && vk == 'D') { run_codex_do_command(app); return; }
+  if (ctrl && shift && vk == 'D')
+  {
+    if (app->doc.dirty)
+      save_dialog(app);
+    if (run_codex_do_command(app))
+      PostMessageW(app->hwnd, WM_CLOSE, 0, 0);
+    return;
+  }
   if (ctrl && (vk == VK_OEM_MINUS || vk == VK_SUBTRACT)) { apply_font_size(app, app->font_size - 2); return; }
   if (ctrl && (vk == VK_OEM_PLUS || vk == VK_ADD)) { apply_font_size(app, app->font_size + 2); return; }
   if (ctrl && (vk == '0' || vk == VK_NUMPAD0)) { apply_font_size(app, FONT_SIZE_DEFAULT); return; }
@@ -3088,24 +3646,82 @@ static void handle_key(App *app, WPARAM vk)
     moved = true;
     break;
   case VK_UP:
-    if (app->cl > 0)
-      set_caret_line_col(app, app->cl - 1, app->cc);
-    else
-      set_caret_line_col(app, 0, 0);
-    moved = true;
-    break;
-  case VK_DOWN:
-    doc_discover_for_view(&app->doc, app->cl, 2);
-    if (app->cl + 1 < app->doc.lines.count)
-      set_caret_line_col(app, app->cl + 1, app->cc);
+    if (ctrl)
+    {
+      if (vscroll_can_line_up(app))
+      {
+        u64 old_tl = app->tl;
+        u64 bottom_visible;
+        app->vsb = false;
+        app->tl--;
+        bottom_visible = app->tl;
+        if (app->rows > 0) bottom_visible += (u64)app->rows - 1;
+        if (app->cl > bottom_visible)
+        {
+          set_caret_line_col(app, bottom_visible, app->cc);
+          moved = true;
+        }
+        else if (app->cl == old_tl && app->cl > 0)
+        {
+          set_caret_line_col(app, app->cl - 1, app->cc);
+          moved = true;
+        }
+      }
+    }
     else
     {
-      u64 start = doc_line_start(&app->doc, app->cl);
-      u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
-      app->cc = end - start;
-      app->co = end;
+      if (app->cl > 0)
+        set_caret_line_col(app, app->cl - 1, app->cc);
+      else
+        set_caret_line_col(app, 0, 0);
+      moved = true;
     }
-    moved = true;
+    break;
+  case VK_DOWN:
+    if (ctrl)
+    {
+      if (vscroll_can_line_down(app))
+      {
+        u64 old_tl = app->tl;
+        u64 bottom_visible = old_tl;
+        if (app->rows > 0) bottom_visible += (u64)app->rows - 1;
+        app->vsb = false;
+        app->tl++;
+        if (app->cl < app->tl)
+        {
+          set_caret_line_col(app, app->tl, app->cc);
+          moved = true;
+        }
+        else if (app->cl >= bottom_visible)
+        {
+          doc_discover_for_view(&app->doc, app->cl, 2);
+          if (app->cl + 1 < app->doc.lines.count)
+            set_caret_line_col(app, app->cl + 1, app->cc);
+          else
+          {
+            u64 start = doc_line_start(&app->doc, app->cl);
+            u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
+            app->cc = end - start;
+            app->co = end;
+          }
+          moved = true;
+        }
+      }
+    }
+    else
+    {
+      doc_discover_for_view(&app->doc, app->cl, 2);
+      if (app->cl + 1 < app->doc.lines.count)
+        set_caret_line_col(app, app->cl + 1, app->cc);
+      else
+      {
+        u64 start = doc_line_start(&app->doc, app->cl);
+        u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
+        app->cc = end - start;
+        app->co = end;
+      }
+      moved = true;
+    }
     break;
   case VK_PRIOR:
     set_caret_line_col(app, app->cl > (u64)app->rows ? app->cl - (u64)app->rows : 0, app->cc);
@@ -3139,7 +3755,8 @@ static void handle_key(App *app, WPARAM vk)
   {
     if (has_box_selection(app))
     {
-      if (apply_basic_edit(app, NULL, 0, true, false)) break;
+      apply_basic_edit(app, NULL, 0, true, false);
+      break;
     }
     if (has_stream_selection(app))
     {
@@ -3191,7 +3808,8 @@ static void handle_key(App *app, WPARAM vk)
   {
     if (has_box_selection(app))
     {
-      if (apply_basic_edit(app, NULL, 0, false, true)) break;
+      apply_basic_edit(app, NULL, 0, false, true);
+      break;
     }
     if (has_stream_selection(app))
     {
@@ -3394,6 +4012,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return 1;
   case WM_PAINT:
   {
+    bool had_focus = GetFocus() == hwnd;
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(hwnd, &ps);
     RECT rc;
@@ -3402,6 +4021,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     HBITMAP old_bmp;
     int w;
     int h;
+    if (had_focus) HideCaret(hwnd);
     GetClientRect(hwnd, &rc);
     w = rc.right - rc.left;
     h = rc.bottom - rc.top;
@@ -3426,6 +4046,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
       paint_editor(app, dc);
     }
     EndPaint(hwnd, &ps);
+    if (had_focus) ShowCaret(hwnd);
     return 0;
   }
   case WM_KEYDOWN:
