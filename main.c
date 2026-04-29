@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -16,7 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <wctype.h>
 #include <direct.h>
+#include "repro/repro_logger.h"
 
 /******************************************************************************
  * Core Types
@@ -34,7 +36,7 @@ typedef uint64_t u64;
 #define EDIT_LINE_NUMBER_RIGHT_PADDING 8
 #define EDIT_TEXT_LEFT_PADDING 8
 #define MIN_WINDOW_WIDTH 200
-#define MIN_WINDOW_HEIGHT 240
+#define MIN_WINDOW_HEIGHT 60
 #define TAB_WIDTH 4
 #define MAX_PAINT_COLS 8192
 #define LINE_DISCOVERY_BUDGET (256u * 1024u)
@@ -48,6 +50,7 @@ typedef uint64_t u64;
 #define THEME_GUTTER_BG THEME_BG
 #define THEME_GUTTER_FG RGB(122, 104, 88)
 #define THEME_TEXT RGB(220, 220, 220)
+#define THEME_CMD_POPUP_BG RGB(48, 43, 35)
 #define THEME_GUTTER_ACTIVE_LINE_BG RGB(68, 58, 48)
 #define THEME_SELECTION_BG RGB(0, 120, 215)
 #define THEME_SELECTION_TEXT RGB(255, 255, 255)
@@ -55,6 +58,15 @@ typedef uint64_t u64;
 #define FONT_SIZE_MAX 48
 #define FONT_SIZE_DEFAULT 20
 #define IDC_FIND_COUNT 5001
+#define WM_APP_RESTORE_EDITOR_FOCUS (WM_APP + 1)
+#define IDC_CMD_EDIT 5101
+#define IDC_CMD_LIST 5102
+#define IDC_FIND_EDIT 5201
+#define IDC_FIND_LIST 5202
+#define MAX_DO_COMMANDS 128
+#define MAX_FIND_RESULTS 512
+#define CMD_POPUP_CLASS_NAME L"TextSuiteCommandPopup"
+#define FIND_POPUP_CLASS_NAME L"TextSuiteFindPopup"
 #ifndef edt1
 #define edt1 0x0480
 #endif
@@ -103,7 +115,9 @@ typedef struct AddBlock
 typedef struct LineIndex
 {
   u64 *starts;
+  int64_t *block_add;
   u64 count, cap, scanned_to;
+  u64 block_cap;
   bool eof;
 } LineIndex;
 
@@ -128,6 +142,21 @@ typedef struct Document
   LineIndex lines;
 } Document;
 
+typedef struct DoCommandEntry
+{
+  WCHAR first[64];
+  WCHAR second[64];
+  WCHAR display[144];
+} DoCommandEntry;
+
+typedef struct FindResult
+{
+  u64 off;
+  u64 len;
+  u64 line;
+  WCHAR preview[160];
+} FindResult;
+
 typedef struct App
 {
   HWND hwnd;
@@ -135,19 +164,21 @@ typedef struct App
   HFONT font;
   int font_size;
   HBRUSH bg_brush;
+  HBRUSH cmd_bg_brush;
   int char_w;
   int line_h;
   int gutter_w;
   int rows;
   int cols;
+  int last_client_w;
+  int last_client_h;
+  bool handling_main_wm_size;
   u64 tl, fc, cl, cc, co, sa, sv;
   bool bsa;
   u64 bal, bac, bcl, bcc, bdc;
   bool vsb;
-  UINT find_msg;
   HWND find_hwnd;
   WCHAR fq[256];
-  FINDREPLACEW fs;
   bool swm;
   bool sbxm;
   bool swdm;
@@ -155,6 +186,28 @@ typedef struct App
   int ch;
   bool clm;
   bool lcp;
+  bool suppress_tab_char_once;
+  HWND cmd_hwnd;
+  HWND cmd_edit;
+  HWND cmd_list;
+  WCHAR cmd_query[128];
+  int cmd_match_indices[MAX_DO_COMMANDS];
+  int cmd_match_count;
+  DoCommandEntry cmd_entries[MAX_DO_COMMANDS];
+  int cmd_entry_count;
+  bool cmd_restore_pending;
+  u64 cmd_saved_co;
+  u64 cmd_saved_sa;
+  u64 cmd_saved_sv;
+  HWND find_edit;
+  HWND find_list;
+  HWND find_count_label;
+  int find_selected_result;
+  int find_result_count;
+  FindResult find_results[MAX_FIND_RESULTS];
+  int wheel_delta_remainder;
+  int zoom_wheel_delta_remainder;
+  bool skip_keep_caret_visible_once;
 } App;
 
 typedef struct SpanRef
@@ -208,11 +261,9 @@ typedef struct Resolve
 
 static App g_app;
 
-static HBRUSH g_find_bg_brush;
+static WNDPROC g_command_edit_wndproc;
 
-static WNDPROC g_find_edit_wndproc;
-
-static WNDPROC g_find_button_wndproc;
+static WNDPROC g_find_popup_edit_wndproc;
 
 static UndoStack g_undo_stack;
 
@@ -223,6 +274,11 @@ static UndoTxn g_txn;
 static int g_txn_depth;
 
 static bool g_history_replaying;
+
+static void repro_capture_ui_state(const App *app, ReproUiState *state);
+static void repro_begin_app_event(const App *app, const char *kind, unsigned long a, unsigned long b);
+static void repro_end_app_event(const App *app);
+static u64 repro_collect_deleted_preview(const SpanRef *spans, size_t span_count, char *buf, u64 cap);
 
 typedef enum PreferredAppMode
 {
@@ -262,6 +318,16 @@ static bool is_word_byte(unsigned char c);
 
 static bool is_space_byte(unsigned char c);
 
+static int wcs_copy_trunc(wchar_t *dst, size_t dst_count, const wchar_t *src);
+
+static int wcs_cat_trunc(wchar_t *dst, size_t dst_count, const wchar_t *src);
+
+static int wcs_copy_n_trunc(wchar_t *dst, size_t dst_count, const wchar_t *src, size_t max_chars);
+
+static int wfmt(wchar_t *dst, size_t dst_count, const wchar_t *fmt, ...);
+
+static ULONGLONG monotonic_tick_ms(void);
+
 /* Document primitives. */
 static int doc_copy_utf8_z(Document *doc, char **out_utf8);
 
@@ -280,7 +346,18 @@ static bool app_doc_insert(App *app, u64 off, const char *text, u64 n);
 
 static bool app_doc_delete(App *app, u64 off, u64 n);
 
+/* Undo/history helpers. */
+static bool doc_capture_spans(Document *doc, u64 off, u64 len, SpanRef **out_spans, size_t *out_count);
+
+static bool txn_record_insert(u64 off, const char *data, u64 len);
+
+static bool txn_record_delete(u64 off, u64 len, SpanRef *spans, size_t span_count);
+
 /* Caret, selection, and repaint. */
+static bool has_stream_selection(const App *app);
+
+static bool has_box_selection(const App *app);
+
 static void sync_caret_from_offsets(App *app);
 
 static void keep_caret_visible(App *app);
@@ -295,17 +372,23 @@ static void request_repaint(App *app, BOOL erase);
 
 static void keep_visible_and_repaint(App *app);
 
+static void set_caret_line_col(App *app, u64 line, u64 col);
+
 static void apply_caret_line_metrics(App *app);
 
 static void apply_scroll_limits_and_count(App *app);
 
 static void apply_scroll_limits_and_position(App *app);
 
+static void preserve_caret_row_for_scroll(App *app, u64 old_top_line);
+
 static void apply_font_size(App *app, int new_size);
 
 static bool sync_path_utf8_on_change(App *app);
 
-static void update_find_count_label(HWND hwnd);
+static void close_find_popup(App *app);
+
+static void open_find_popup(App *app);
 
 static void box_selection_bounds(const App *app, u64 *top, u64 *bottom, u64 *left, u64 *right);
 
@@ -313,38 +396,48 @@ static bool doc_get_byte(Document *doc, u64 off, unsigned char *out);
 
 static void doc_discover_for_view(Document *doc, u64 first_line, u64 rows);
 
-/******************************************************************************
- * Caret Utilities
- ******************************************************************************/
-static int desired_caret_height(const App *app)
-{
-  if (app->bsa)
-  {
-    u64 top = app->bal < app->bcl ? app->bal : app->bcl;
-    u64 bottom = app->bal > app->bcl ? app->bal : app->bcl;
-    u64 span = bottom - top + 1;
-    if (span > (u64)INT_MAX) span = (u64)INT_MAX;
-    return (int)span * app->line_h;
-  }
-  return app->line_h;
-}
+static void force_focus_window(HWND hwnd);
 
-static void ensure_caret_shape(App *app)
-{
-  int target_h;
-  if (GetFocus() != app->hwnd) return;
-  target_h = desired_caret_height(app);
-  if (target_h < 1) target_h = 1;
-  if (app->ch == target_h) return;
-  if (app->ch > 0)
-  {
-    HideCaret(app->hwnd);
-    DestroyCaret();
-  }
-  CreateCaret(app->hwnd, NULL, 2, target_h);
-  ShowCaret(app->hwnd);
-  app->ch = target_h;
-}
+/* Command popup helpers. */
+static void close_command_popup(App *app);
+
+static void open_command_popup(App *app);
+
+/* Command/edit helpers used by input handling before their definitions. */
+static void open_dialog(App *app);
+
+static void save_dialog(App *app);
+
+static void save_as_dialog(App *app);
+
+static void copy_box_selection_to_clipboard(App *app);
+
+static void copy_selection_or_current_line_to_clipboard(App *app);
+
+static void copy_current_line_to_clipboard(App *app);
+
+static bool current_line_range(App *app, u64 *out_start, u64 *out_end);
+
+static bool run_codex_do_command(App *app);
+
+static void paste_clipboard(App *app);
+
+static bool seed_find_query_from_selection(App *app);
+
+static bool find_next(App *app, const WCHAR *query);
+
+static bool move_caret_line_by_swap(App *app, bool move_down);
+
+static void move_caret_word_left(App *app);
+
+static void move_caret_left(App *app);
+
+static void move_caret_word_right(App *app);
+
+static void move_caret_right(App *app);
+static bool doc_get_byte(Document *doc, u64 off, unsigned char *out);
+static u64 doc_line_first_nonblank_col(Document *doc, u64 line);
+
 
 /******************************************************************************
  * Core Helpers
@@ -371,384 +464,78 @@ static bool is_space_byte(unsigned char c)
   return c == ' ' || c == '\t';
 }
 
-/******************************************************************************
- * Undo / Redo
- ******************************************************************************/
-static void undo_op_free(UndoOp *op)
+static int wcs_copy_trunc(wchar_t *dst, size_t dst_count, const wchar_t *src)
 {
-  if (!op) return;
-  free(op->spans);
-  memset(op, 0, sizeof(*op));
-}
-
-static void undo_txn_free(UndoTxn *txn)
-{
-  if (!txn) return;
-  for (size_t i = 0; i < txn->count; ++i) undo_op_free(&txn->ops[i]);
-  free(txn->ops);
-  memset(txn, 0, sizeof(*txn));
-}
-
-static void undo_stack_clear(UndoStack *stack)
-{
-  if (!stack) return;
-  for (size_t i = 0; i < stack->count; ++i) undo_txn_free(&stack->items[i]);
-  free(stack->items);
-  memset(stack, 0, sizeof(*stack));
-}
-
-static bool undo_stack_push(UndoStack *stack, const UndoTxn *txn)
-{
-  if (stack->count == stack->cap)
+  size_t i = 0;
+  if (!dst || dst_count == 0) return 22;
+  if (!src)
   {
-    size_t new_cap = stack->cap ? stack->cap * 2 : 16;
-    UndoTxn *new_items = (UndoTxn *)realloc(stack->items, new_cap *sizeof(UndoTxn));
-    if (!new_items) return false;
-    stack->items = new_items;
-    stack->cap = new_cap;
+    dst[0] = 0;
+    return 22;
   }
-  stack->items[stack->count++] = *txn;
-  return true;
-}
-
-static bool undo_txn_push_op(UndoTxn *txn, const UndoOp *op)
-{
-  if (txn->count == txn->cap)
+  while (i + 1 < dst_count && src[i])
   {
-    size_t new_cap = txn->cap ? txn->cap * 2 : 8;
-    UndoOp *new_ops = (UndoOp *)realloc(txn->ops, new_cap *sizeof(UndoOp));
-    if (!new_ops) return false;
-    txn->ops = new_ops;
-    txn->cap = new_cap;
+    dst[i] = src[i];
+    i++;
   }
-  txn->ops[txn->count++] = *op;
-  return true;
+  dst[i] = 0;
+  return src[i] ? 80 : 0;
 }
 
-static bool begin_edit_txn(App *app)
+static int wcs_cat_trunc(wchar_t *dst, size_t dst_count, const wchar_t *src)
 {
-  if (g_history_replaying) return true;
-  if (g_txn_depth == 0)
+  size_t used = 0;
+  if (!dst || dst_count == 0) return 22;
+  while (used < dst_count && dst[used]) used++;
+  if (used == dst_count) return 80;
+  return wcs_copy_trunc(dst + used, dst_count - used, src);
+}
+
+static int wcs_copy_n_trunc(wchar_t *dst, size_t dst_count, const wchar_t *src, size_t max_chars)
+{
+  size_t i = 0;
+  if (!dst || dst_count == 0) return 22;
+  if (!src)
   {
-    undo_txn_free(&g_txn);
-    memset(&g_txn, 0, sizeof(g_txn));
-    g_txn.before_caret_off = app->co;
-    g_txn.before_sel_anchor = app->sa;
-    g_txn.before_sel_active = app->sv;
-    g_txn.before_dirty = app->doc.dirty;
-    undo_stack_clear(&g_redo_stack);
+    dst[0] = 0;
+    return 22;
   }
-  g_txn_depth++;
-  return true;
-}
-
-static void end_edit_txn(App *app)
-{
-  if (g_history_replaying || g_txn_depth <= 0) return;
-  g_txn_depth--;
-  if (g_txn_depth != 0) return;
-  if (g_txn.count == 0)
+  while (i + 1 < dst_count && i < max_chars && src[i])
   {
-    undo_txn_free(&g_txn);
-    return;
+    dst[i] = src[i];
+    i++;
   }
-  g_txn.after_caret_off = app->co;
-  g_txn.after_sel_anchor = app->sa;
-  g_txn.after_sel_active = app->sv;
-  g_txn.after_dirty = app->doc.dirty;
-  if (!undo_stack_push(&g_undo_stack, &g_txn))
+  dst[i] = 0;
+  return (i == max_chars || src[i] == 0) ? 0 : 80;
+}
+
+static int wfmt(wchar_t *dst, size_t dst_count, const wchar_t *fmt, ...)
+{
+  int rc;
+  va_list args;
+  if (!dst || dst_count == 0 || !fmt) return -1;
+  va_start(args, fmt);
+  rc = _vsnwprintf_s(dst, dst_count, _TRUNCATE, fmt, args);
+  va_end(args);
+  dst[dst_count - 1] = 0;
+  return rc;
+}
+
+static ULONGLONG monotonic_tick_ms(void)
+{
+  static ULONGLONG (WINAPI *get_tick_count64)(void);
+  static int initialized;
+  if (!initialized)
   {
-    undo_txn_free(&g_txn);
-    return;
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (k32) get_tick_count64 = (ULONGLONG (WINAPI *)(void))GetProcAddress(k32, "GetTickCount64");
+    initialized = 1;
   }
-  memset(&g_txn, 0, sizeof(g_txn));
+  if (get_tick_count64) return get_tick_count64();
+  return (ULONGLONG)GetTickCount();
 }
 
-static void clear_history(void)
-{
-  undo_txn_free(&g_txn);
-  g_txn_depth = 0;
-  undo_stack_clear(&g_undo_stack);
-  undo_stack_clear(&g_redo_stack);
-}
 
-static bool doc_capture_spans(Document *doc, u64 off, u64 len, SpanRef **out_spans, size_t *out_count)
-{
-  SpanRef *spans = NULL;
-  size_t count = 0;
-  size_t cap = 0;
-  if (off >= doc->len || len == 0)
-  {
-    *out_spans = NULL;
-    *out_count = 0;
-    return true;
-  }
-  if (off + len > doc->len) len = doc->len - off;
-  Resolve r = doc_resolve_offset(doc, off);
-  Piece *p = r.piece;
-  u64 local = r.local;
-  while (p && len)
-  {
-    u64 take = min_u64(p->len - local, len);
-    if (take)
-    {
-      if (count == cap)
-      {
-        size_t new_cap = cap ? cap * 2 : 8;
-        SpanRef *new_spans = (SpanRef *)realloc(spans, new_cap *sizeof(SpanRef));
-        if (!new_spans)
-        {
-          free(spans);
-          return false;
-        }
-        spans = new_spans;
-        cap = new_cap;
-      }
-      spans[count].data = p->data + local;
-      spans[count].len = take;
-      spans[count].kind = p->kind;
-      count++;
-    }
-    len -= take;
-    p = p->next;
-    local = 0;
-  }
-  *out_spans = spans;
-  *out_count = count;
-  return true;
-}
-
-static bool txn_record_insert(u64 off, const char *data, u64 len)
-{
-  UndoOp op;
-  SpanRef *spans;
-  if (g_history_replaying || g_txn_depth <= 0 || len == 0) return true;
-  spans = (SpanRef *)malloc(sizeof(SpanRef));
-  if (!spans) return false;
-  spans[0].data = data;
-  spans[0].len = len;
-  spans[0].kind = BACKING_ADD;
-  memset(&op, 0, sizeof(op));
-  op.kind = UNDO_OP_INSERT;
-  op.off = off;
-  op.len = len;
-  op.spans = spans;
-  op.span_count = 1;
-  if (!undo_txn_push_op(&g_txn, &op))
-  {
-    free(spans);
-    return false;
-  }
-  return true;
-}
-
-static bool txn_record_delete(u64 off, u64 len, SpanRef *spans, size_t span_count)
-{
-  UndoOp op;
-  if (g_history_replaying || g_txn_depth <= 0 || len == 0)
-  {
-    free(spans);
-    return true;
-  }
-  memset(&op, 0, sizeof(op));
-  op.kind = UNDO_OP_DELETE;
-  op.off = off;
-  op.len = len;
-  op.spans = spans;
-  op.span_count = span_count;
-  if (!undo_txn_push_op(&g_txn, &op))
-  {
-    free(spans);
-    return false;
-  }
-  return true;
-}
-
-static bool doc_reinsert_spans(Document *doc, u64 off, const SpanRef *spans, size_t span_count)
-{
-  u64 at = off;
-  for (size_t i = 0; i < span_count; ++i)
-  {
-    if (!doc_insert_span(doc, at, spans[i].data, spans[i].len, spans[i].kind)) return false;
-    at += spans[i].len;
-  }
-  return true;
-}
-
-static void apply_after_state(App *app, const UndoTxn *txn, bool after)
-{
-  if (after)
-  {
-    app->co = min_u64(txn->after_caret_off, app->doc.len);
-    app->sa = min_u64(txn->after_sel_anchor, app->doc.len);
-    app->sv = min_u64(txn->after_sel_active, app->doc.len);
-    app->doc.dirty = txn->after_dirty;
-  }
-  else
-  {
-    app->co = min_u64(txn->before_caret_off, app->doc.len);
-    app->sa = min_u64(txn->before_sel_anchor, app->doc.len);
-    app->sv = min_u64(txn->before_sel_active, app->doc.len);
-    app->doc.dirty = txn->before_dirty;
-  }
-  sync_caret_from_offsets(app);
-  keep_caret_visible(app);
-  update_title(app);
-  request_repaint(app, FALSE);
-}
-
-static bool apply_txn_forward(App *app, const UndoTxn *txn)
-{
-  for (size_t i = 0; i < txn->count; ++i)
-  {
-    const UndoOp *op = &txn->ops[i];
-    if (op->kind == UNDO_OP_INSERT)
-    {
-      if (!doc_reinsert_spans(&app->doc, op->off, op->spans, op->span_count)) return false;
-    }
-    else
-    {
-      if (!doc_delete_range(&app->doc, op->off, op->len)) return false;
-    }
-  }
-  return true;
-}
-
-static bool apply_txn_reverse(App *app, const UndoTxn *txn)
-{
-  for (size_t i = txn->count; i-- > 0;)
-  {
-    const UndoOp *op = &txn->ops[i];
-    if (op->kind == UNDO_OP_INSERT)
-    {
-      if (!doc_delete_range(&app->doc, op->off, op->len)) return false;
-    }
-    else
-    {
-      if (!doc_reinsert_spans(&app->doc, op->off, op->spans, op->span_count)) return false;
-    }
-  }
-  return true;
-}
-
-static void perform_undo(App *app)
-{
-  if (g_txn_depth > 0) end_edit_txn(app);
-  if (g_undo_stack.count == 0) return;
-  UndoTxn txn = g_undo_stack.items[g_undo_stack.count - 1];
-  g_undo_stack.count--;
-  g_history_replaying = true;
-  if (apply_txn_reverse(app, &txn))
-  {
-    apply_after_state(app, &txn, false);
-    if (!undo_stack_push(&g_redo_stack, &txn)) undo_txn_free(&txn);
-  }
-  else
-    undo_txn_free(&txn);
-  g_history_replaying = false;
-}
-
-static void perform_redo(App *app)
-{
-  if (g_txn_depth > 0) end_edit_txn(app);
-  if (g_redo_stack.count == 0) return;
-  UndoTxn txn = g_redo_stack.items[g_redo_stack.count - 1];
-  g_redo_stack.count--;
-  g_history_replaying = true;
-  if (apply_txn_forward(app, &txn))
-  {
-    apply_after_state(app, &txn, true);
-    if (!undo_stack_push(&g_undo_stack, &txn)) undo_txn_free(&txn);
-  }
-  else
-    undo_txn_free(&txn);
-  g_history_replaying = false;
-}
-
-/******************************************************************************
- * Win32 Theme / Platform
- ******************************************************************************/
-static void init_native_dark_mode(void)
-{
-  HMODULE theme = LoadLibraryW(L"uxtheme.dll");
-  if (!theme) return;
-  g_set_preferred_app_mode = (SetPreferredAppModeFn)GetProcAddress(theme, MAKEINTRESOURCEA(135));
-  g_allow_dark_mode_for_window = (AllowDarkModeForWindowFn)GetProcAddress(theme, MAKEINTRESOURCEA(133));
-  g_flush_menu_themes = (FlushMenuThemesFn)GetProcAddress(theme, MAKEINTRESOURCEA(136));
-  if (g_set_preferred_app_mode) g_set_preferred_app_mode(APP_MODE_FORCE_DARK);
-  if (g_flush_menu_themes) g_flush_menu_themes();
-}
-
-static void apply_native_dark_mode(HWND hwnd)
-{
-  BOOL enabled = TRUE;
-  COLORREF bg = THEME_BG;
-  COLORREF fg = THEME_FG;
-  if (g_allow_dark_mode_for_window) g_allow_dark_mode_for_window(hwnd, TRUE);
-  SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
-  DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enabled, sizeof(enabled));
-  DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &bg, sizeof(bg));
-  DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &bg, sizeof(bg));
-  DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &fg, sizeof(fg));
-}
-
-static int scroll_max_pos(const SCROLLINFO *si)
-{
-  int page = si->nPage > 0 ? (int)si->nPage : 1;
-  int max_pos = si->nMax - page + 1;
-  return max_pos > si->nMin ? max_pos : si->nMin;
-}
-
-static bool vscroll_can_line_up(const App *app)
-{
-  SCROLLINFO si;
-  int max_pos;
-  memset(&si, 0, sizeof(si));
-  si.cbSize = sizeof(si);
-  si.fMask = SIF_RANGE | SIF_PAGE;
-  if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
-  max_pos = scroll_max_pos(&si);
-  if (max_pos <= si.nMin) return false;
-  return app->tl > (u64)si.nMin;
-}
-
-static bool vscroll_can_line_down(App *app)
-{
-  SCROLLINFO si;
-  int max_pos;
-  memset(&si, 0, sizeof(si));
-  si.cbSize = sizeof(si);
-  si.fMask = SIF_RANGE | SIF_PAGE;
-  if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
-  max_pos = scroll_max_pos(&si);
-  if (max_pos <= si.nMin) return false;
-  if (app->tl < (u64)max_pos) return true;
-  if (!app->doc.lines.eof)
-  {
-    u64 budget_rows = (u64)(app->rows > 0 ? app->rows : 1);
-    doc_discover_for_view(&app->doc, app->tl + 1, budget_rows);
-    update_scrollbars(app);
-    memset(&si, 0, sizeof(si));
-    si.cbSize = sizeof(si);
-    si.fMask = SIF_RANGE | SIF_PAGE;
-    if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
-    max_pos = scroll_max_pos(&si);
-  }
-  return app->tl < (u64)max_pos;
-}
-
-static bool cursor_at_vscroll_bottom(HWND hwnd)
-{
-  SCROLLBARINFO sbi;
-  POINT pt;
-  int arrow_h = GetSystemMetrics(SM_CYVSCROLL);
-  ZeroMemory(&sbi, sizeof(sbi));
-  sbi.cbSize = sizeof(sbi);
-  if (!GetCursorPos(&pt)) return false;
-  if (!GetScrollBarInfo(hwnd, OBJID_VSCROLL, &sbi)) return false;
-  if (pt.x < sbi.rcScrollBar.left || pt.x > sbi.rcScrollBar.right) return false;
-  return pt.y >= sbi.rcScrollBar.bottom - arrow_h * 2;
-}
 
 /******************************************************************************
  * Document Storage And Piece List
@@ -764,20 +551,64 @@ static void mapped_close(MappedFile *mf)
 static void line_index_free(LineIndex *li)
 {
   free(li->starts);
+  free(li->block_add);
   memset(li, 0, sizeof(*li));
+}
+
+enum
+{
+  LINE_INDEX_BLOCK_SHIFT = 10,
+  LINE_INDEX_BLOCK_SIZE = 1 << LINE_INDEX_BLOCK_SHIFT
+};
+
+static u64 line_index_blocks_for_count(u64 count)
+{
+  return (count + (u64)LINE_INDEX_BLOCK_SIZE - 1) >> LINE_INDEX_BLOCK_SHIFT;
+}
+
+static bool line_index_ensure_block_capacity(LineIndex *li, u64 need_count)
+{
+  u64 need_blocks = line_index_blocks_for_count(need_count);
+  if (need_blocks <= li->block_cap) return true;
+  {
+    u64 new_cap = li->block_cap ? li->block_cap : 4;
+    int64_t *new_add;
+    while (new_cap < need_blocks) new_cap *= 2;
+    new_add = (int64_t *)realloc(li->block_add, (size_t)(new_cap * sizeof(int64_t)));
+    if (!new_add) return false;
+    for (u64 i = li->block_cap; i < new_cap; ++i) new_add[i] = 0;
+    li->block_add = new_add;
+    li->block_cap = new_cap;
+  }
+  return true;
+}
+
+static u64 line_index_start_at(const LineIndex *li, u64 line)
+{
+  u64 block = line >> LINE_INDEX_BLOCK_SHIFT;
+  int64_t add = (block < li->block_cap) ? li->block_add[block] : 0;
+  if (add >= 0) return li->starts[line] + (u64)add;
+  return li->starts[line] - (u64)(-add);
 }
 
 static bool line_index_push_start(LineIndex *li, u64 off)
 {
+  u64 line = li->count;
+  u64 block = line >> LINE_INDEX_BLOCK_SHIFT;
   if (li->count == li->cap)
   {
     u64 new_cap = li->cap ? li->cap * 2 : 4096;
-    u64 *new_starts = (u64 *)realloc(li->starts, (size_t)(new_cap *sizeof(u64)));
+    u64 *new_starts = (u64 *)realloc(li->starts, (size_t)(new_cap * sizeof(u64)));
     if (!new_starts) return false;
     li->starts = new_starts;
     li->cap = new_cap;
   }
-  li->starts[li->count++] = off;
+  if (!line_index_ensure_block_capacity(li, li->count + 1)) return false;
+  {
+    int64_t add = li->block_add[block];
+    if (add >= 0) li->starts[li->count++] = off - (u64)add;
+    else li->starts[li->count++] = off + (u64)(-add);
+  }
   return true;
 }
 
@@ -797,33 +628,57 @@ static void line_index_invalidate_from(LineIndex *li, u64 off)
     li->eof = false;
     return;
   }
-  while (keep < li->count && li->starts[keep] <= off) ++keep;
+  while (keep < li->count && line_index_start_at(li, keep) <= off) ++keep;
   li->count = keep;
+  {
+    u64 keep_blocks = line_index_blocks_for_count(keep);
+    for (u64 b = keep_blocks; b < li->block_cap; ++b) li->block_add[b] = 0;
+  }
   if (li->scanned_to >= off) li->scanned_to = off;
   li->eof = false;
 }
 
+static u64 line_index_first_after(const LineIndex *li, u64 off)
+{
+  u64 lo = 1;
+  u64 hi = li->count;
+  while (lo < hi)
+  {
+    u64 mid = lo + (hi - lo) / 2;
+    if (line_index_start_at(li, mid) > off) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+static void line_index_add_from(LineIndex *li, u64 start, int64_t delta)
+{
+  if (delta == 0 || start >= li->count) return;
+  {
+    u64 first_block = start >> LINE_INDEX_BLOCK_SHIFT;
+    u64 first_block_end = min_u64(li->count, ((first_block + 1) << LINE_INDEX_BLOCK_SHIFT));
+    for (u64 i = start; i < first_block_end; ++i)
+    {
+      if (delta >= 0) li->starts[i] += (u64)delta;
+      else li->starts[i] -= (u64)(-delta);
+    }
+    for (u64 b = first_block + 1; (b << LINE_INDEX_BLOCK_SHIFT) < li->count; ++b)
+      li->block_add[b] += delta;
+  }
+}
+
 static void line_index_adjust_insert(LineIndex *li, u64 off, u64 n)
 {
-  for (u64 i = 1; i < li->count; ++i)
-  {
-    if (li->starts[i] > off) li->starts[i] += n;
-  }
+  u64 first = line_index_first_after(li, off);
+  line_index_add_from(li, first, (int64_t)n);
   if (li->scanned_to > off) li->scanned_to += n;
 }
 
 static void line_index_adjust_delete(LineIndex *li, u64 off, u64 n)
 {
-  u64 end = off + n;
-  for (u64 i = 1; i < li->count; ++i)
-  {
-    if (li->starts[i] > end)
-      li->starts[i] -= n;
-    else if (li->starts[i] > off)
-      li->starts[i] = off;
-  }
-  if (li->scanned_to > end)
-    li->scanned_to -= n;
+  u64 first = line_index_first_after(li, off);
+  line_index_add_from(li, first, -(int64_t)n);
+  if (li->scanned_to > off + n) li->scanned_to -= n;
   else if (li->scanned_to > off)
   {
     li->scanned_to = off;
@@ -1205,6 +1060,7 @@ static bool app_doc_insert(App *app, u64 off, const char *text, u64 n)
   const char *add_ptr = NULL;
   if (!doc_insert_bytes(&app->doc, off, text, n, &add_ptr)) return false;
   if (!txn_record_insert(off, add_ptr, n)) return false;
+  repro_note_insert((unsigned long long)off, (unsigned long long)n, add_ptr ? add_ptr : text, (unsigned long long)n);
   return true;
 }
 
@@ -1218,6 +1074,12 @@ static bool app_doc_delete(App *app, u64 off, u64 n)
   if (g_txn_depth > 0 && !g_history_replaying)
   {
     if (!doc_capture_spans(&app->doc, off, del_len, &spans, &span_count)) return false;
+  }
+  if (spans && span_count > 0)
+  {
+    char preview[32];
+    u64 preview_len = repro_collect_deleted_preview(spans, span_count, preview, (u64)sizeof(preview));
+    repro_note_delete((unsigned long long)off, (unsigned long long)del_len, preview, (unsigned long long)preview_len);
   }
   if (!doc_delete_range(&app->doc, off, del_len))
   {
@@ -1293,6 +1155,8 @@ static bool doc_save(Document *doc, const WCHAR *path)
   return true;
 }
 
+
+
 /******************************************************************************
  * Line Index
  ******************************************************************************/
@@ -1365,7 +1229,7 @@ static u64 doc_line_start(Document *doc, u64 line)
 {
   doc_ensure_line(doc, line);
   if (line >= doc->lines.count) return doc->len;
-  return doc->lines.starts[line];
+  return line_index_start_at(&doc->lines, line);
 }
 
 static u64 doc_line_length_clamped(Document *doc, u64 start, u64 limit)
@@ -1398,6 +1262,21 @@ static u64 doc_line_col_clamped(Document *doc, u64 line, u64 col)
   return min_u64(col, end - start);
 }
 
+static u64 doc_line_first_nonblank_col(Document *doc, u64 line)
+{
+  u64 start = doc_line_start(doc, line);
+  u64 end = doc_line_length_clamped(doc, start, UINT32_MAX);
+  u64 col = 0;
+  while (start + col < end)
+  {
+    unsigned char ch = 0;
+    if (!doc_get_byte(doc, start + col, &ch)) break;
+    if (ch != ' ' && ch != '\t' && ch != '\r') break;
+    ++col;
+  }
+  return col;
+}
+
 static void doc_discover_all_lines(Document *doc)
 {
   while (!doc->lines.eof)
@@ -1426,7 +1305,7 @@ static void doc_offset_to_line_col(Document *doc, u64 off, u64 *out_line, u64 *o
   while (lo < hi)
   {
     u64 mid = lo + (hi - lo) / 2;
-    if (doc->lines.starts[mid] <= off)
+    if (line_index_start_at(&doc->lines, mid) <= off)
     {
       line = mid;
       lo = mid + 1;
@@ -1435,8 +1314,520 @@ static void doc_offset_to_line_col(Document *doc, u64 off, u64 *out_line, u64 *o
       hi = mid;
   }
   *out_line = line;
-  *out_col = off - doc->lines.starts[line];
+  *out_col = off - line_index_start_at(&doc->lines, line);
 }
+
+
+
+/******************************************************************************
+ * Undo / Redo
+ ******************************************************************************/
+static void undo_op_free(UndoOp *op)
+{
+  if (!op) return;
+  free(op->spans);
+  memset(op, 0, sizeof(*op));
+}
+
+static void undo_txn_free(UndoTxn *txn)
+{
+  if (!txn) return;
+  for (size_t i = 0; i < txn->count; ++i) undo_op_free(&txn->ops[i]);
+  free(txn->ops);
+  memset(txn, 0, sizeof(*txn));
+}
+
+static void undo_stack_clear(UndoStack *stack)
+{
+  if (!stack) return;
+  for (size_t i = 0; i < stack->count; ++i) undo_txn_free(&stack->items[i]);
+  free(stack->items);
+  memset(stack, 0, sizeof(*stack));
+}
+
+static bool undo_stack_push(UndoStack *stack, const UndoTxn *txn)
+{
+  if (stack->count == stack->cap)
+  {
+    size_t new_cap = stack->cap ? stack->cap * 2 : 16;
+    UndoTxn *new_items = (UndoTxn *)realloc(stack->items, new_cap *sizeof(UndoTxn));
+    if (!new_items) return false;
+    stack->items = new_items;
+    stack->cap = new_cap;
+  }
+  stack->items[stack->count++] = *txn;
+  return true;
+}
+
+static bool undo_txn_push_op(UndoTxn *txn, const UndoOp *op)
+{
+  if (txn->count == txn->cap)
+  {
+    size_t new_cap = txn->cap ? txn->cap * 2 : 8;
+    UndoOp *new_ops = (UndoOp *)realloc(txn->ops, new_cap *sizeof(UndoOp));
+    if (!new_ops) return false;
+    txn->ops = new_ops;
+    txn->cap = new_cap;
+  }
+  txn->ops[txn->count++] = *op;
+  return true;
+}
+
+static bool begin_edit_txn(App *app)
+{
+  if (g_history_replaying) return true;
+  if (g_txn_depth == 0)
+  {
+    undo_txn_free(&g_txn);
+    memset(&g_txn, 0, sizeof(g_txn));
+    g_txn.before_caret_off = app->co;
+    g_txn.before_sel_anchor = app->sa;
+    g_txn.before_sel_active = app->sv;
+    g_txn.before_dirty = app->doc.dirty;
+    undo_stack_clear(&g_redo_stack);
+  }
+  g_txn_depth++;
+  return true;
+}
+
+static void end_edit_txn(App *app)
+{
+  if (g_history_replaying || g_txn_depth <= 0) return;
+  g_txn_depth--;
+  if (g_txn_depth != 0) return;
+  if (g_txn.count == 0)
+  {
+    undo_txn_free(&g_txn);
+    return;
+  }
+  g_txn.after_caret_off = app->co;
+  g_txn.after_sel_anchor = app->sa;
+  g_txn.after_sel_active = app->sv;
+  g_txn.after_dirty = app->doc.dirty;
+  if (!undo_stack_push(&g_undo_stack, &g_txn))
+  {
+    undo_txn_free(&g_txn);
+    return;
+  }
+  memset(&g_txn, 0, sizeof(g_txn));
+}
+
+static void clear_history(void)
+{
+  undo_txn_free(&g_txn);
+  g_txn_depth = 0;
+  undo_stack_clear(&g_undo_stack);
+  undo_stack_clear(&g_redo_stack);
+}
+
+static bool doc_capture_spans(Document *doc, u64 off, u64 len, SpanRef **out_spans, size_t *out_count)
+{
+  SpanRef *spans = NULL;
+  size_t count = 0;
+  size_t cap = 0;
+  if (off >= doc->len || len == 0)
+  {
+    *out_spans = NULL;
+    *out_count = 0;
+    return true;
+  }
+  if (off + len > doc->len) len = doc->len - off;
+  Resolve r = doc_resolve_offset(doc, off);
+  Piece *p = r.piece;
+  u64 local = r.local;
+  while (p && len)
+  {
+    u64 take = min_u64(p->len - local, len);
+    if (take)
+    {
+      if (count == cap)
+      {
+        size_t new_cap = cap ? cap * 2 : 8;
+        SpanRef *new_spans = (SpanRef *)realloc(spans, new_cap *sizeof(SpanRef));
+        if (!new_spans)
+        {
+          free(spans);
+          return false;
+        }
+        spans = new_spans;
+        cap = new_cap;
+      }
+      spans[count].data = p->data + local;
+      spans[count].len = take;
+      spans[count].kind = p->kind;
+      count++;
+    }
+    len -= take;
+    p = p->next;
+    local = 0;
+  }
+  *out_spans = spans;
+  *out_count = count;
+  return true;
+}
+
+static bool txn_record_insert(u64 off, const char *data, u64 len)
+{
+  UndoOp op;
+  SpanRef *spans;
+  if (g_history_replaying || g_txn_depth <= 0 || len == 0) return true;
+  spans = (SpanRef *)malloc(sizeof(SpanRef));
+  if (!spans) return false;
+  spans[0].data = data;
+  spans[0].len = len;
+  spans[0].kind = BACKING_ADD;
+  memset(&op, 0, sizeof(op));
+  op.kind = UNDO_OP_INSERT;
+  op.off = off;
+  op.len = len;
+  op.spans = spans;
+  op.span_count = 1;
+  if (!undo_txn_push_op(&g_txn, &op))
+  {
+    free(spans);
+    return false;
+  }
+  return true;
+}
+
+static bool txn_record_delete(u64 off, u64 len, SpanRef *spans, size_t span_count)
+{
+  UndoOp op;
+  if (g_history_replaying || g_txn_depth <= 0 || len == 0)
+  {
+    free(spans);
+    return true;
+  }
+  memset(&op, 0, sizeof(op));
+  op.kind = UNDO_OP_DELETE;
+  op.off = off;
+  op.len = len;
+  op.spans = spans;
+  op.span_count = span_count;
+  if (!undo_txn_push_op(&g_txn, &op))
+  {
+    free(spans);
+    return false;
+  }
+  return true;
+}
+
+static bool doc_reinsert_spans(Document *doc, u64 off, const SpanRef *spans, size_t span_count)
+{
+  u64 at = off;
+  for (size_t i = 0; i < span_count; ++i)
+  {
+    if (!doc_insert_span(doc, at, spans[i].data, spans[i].len, spans[i].kind)) return false;
+    at += spans[i].len;
+  }
+  return true;
+}
+
+static void apply_after_state(App *app, const UndoTxn *txn, bool after)
+{
+  if (after)
+  {
+    app->co = min_u64(txn->after_caret_off, app->doc.len);
+    app->sa = min_u64(txn->after_sel_anchor, app->doc.len);
+    app->sv = min_u64(txn->after_sel_active, app->doc.len);
+    app->doc.dirty = txn->after_dirty;
+  }
+  else
+  {
+    app->co = min_u64(txn->before_caret_off, app->doc.len);
+    app->sa = min_u64(txn->before_sel_anchor, app->doc.len);
+    app->sv = min_u64(txn->before_sel_active, app->doc.len);
+    app->doc.dirty = txn->before_dirty;
+  }
+  sync_caret_from_offsets(app);
+  keep_caret_visible(app);
+  update_title(app);
+  request_repaint(app, FALSE);
+}
+
+static bool apply_txn_forward(App *app, const UndoTxn *txn)
+{
+  for (size_t i = 0; i < txn->count; ++i)
+  {
+    const UndoOp *op = &txn->ops[i];
+    if (op->kind == UNDO_OP_INSERT)
+    {
+      if (!doc_reinsert_spans(&app->doc, op->off, op->spans, op->span_count)) return false;
+    }
+    else
+    {
+      if (!doc_delete_range(&app->doc, op->off, op->len)) return false;
+    }
+  }
+  return true;
+}
+
+static bool apply_txn_reverse(App *app, const UndoTxn *txn)
+{
+  for (size_t i = txn->count; i-- > 0;)
+  {
+    const UndoOp *op = &txn->ops[i];
+    if (op->kind == UNDO_OP_INSERT)
+    {
+      if (!doc_delete_range(&app->doc, op->off, op->len)) return false;
+    }
+    else
+    {
+      if (!doc_reinsert_spans(&app->doc, op->off, op->spans, op->span_count)) return false;
+    }
+  }
+  return true;
+}
+
+static void perform_undo(App *app)
+{
+  if (g_txn_depth > 0) end_edit_txn(app);
+  if (g_undo_stack.count == 0) return;
+  UndoTxn txn = g_undo_stack.items[g_undo_stack.count - 1];
+  g_undo_stack.count--;
+  g_history_replaying = true;
+  if (apply_txn_reverse(app, &txn))
+  {
+    apply_after_state(app, &txn, false);
+    if (!undo_stack_push(&g_redo_stack, &txn)) undo_txn_free(&txn);
+  }
+  else
+    undo_txn_free(&txn);
+  g_history_replaying = false;
+}
+
+static void perform_redo(App *app)
+{
+  if (g_txn_depth > 0) end_edit_txn(app);
+  if (g_redo_stack.count == 0) return;
+  UndoTxn txn = g_redo_stack.items[g_redo_stack.count - 1];
+  g_redo_stack.count--;
+  g_history_replaying = true;
+  if (apply_txn_forward(app, &txn))
+  {
+    apply_after_state(app, &txn, true);
+    if (!undo_stack_push(&g_undo_stack, &txn)) undo_txn_free(&txn);
+  }
+  else
+    undo_txn_free(&txn);
+  g_history_replaying = false;
+}
+
+
+
+/******************************************************************************
+ * Caret Utilities
+ ******************************************************************************/
+static int desired_caret_height(const App *app)
+{
+  if (app->bsa)
+  {
+    u64 top = app->bal < app->bcl ? app->bal : app->bcl;
+    u64 bottom = app->bal > app->bcl ? app->bal : app->bcl;
+    u64 span = bottom - top + 1;
+    if (span > (u64)INT_MAX) span = (u64)INT_MAX;
+    return (int)span * app->line_h;
+  }
+  return app->line_h;
+}
+
+static void ensure_caret_shape(App *app)
+{
+  int target_h;
+  if (GetFocus() != app->hwnd) return;
+  target_h = desired_caret_height(app);
+  if (target_h < 1) target_h = 1;
+  if (app->ch == target_h) return;
+  if (app->ch > 0)
+  {
+    HideCaret(app->hwnd);
+    DestroyCaret();
+  }
+  CreateCaret(app->hwnd, NULL, 2, target_h);
+  ShowCaret(app->hwnd);
+  app->ch = target_h;
+}
+
+
+
+/******************************************************************************
+ * Rendering
+ ******************************************************************************/
+typedef struct VisibleCtx
+{
+  u64 skip;
+  WCHAR *out;
+  int n;
+  int max;
+} VisibleCtx;
+
+static void visible_span(const char *data, u64 len, void *user)
+{
+  VisibleCtx *ctx = (VisibleCtx *)user;
+  if (ctx->skip >= len)
+  {
+    ctx->skip -= len;
+    return;
+  }
+  data += ctx->skip;
+  len -= ctx->skip;
+  ctx->skip = 0;
+  for (u64 i = 0; i < len && ctx->n < ctx->max; ++i)
+  {
+    unsigned char c = (unsigned char)data[i];
+    if (c == '\r' || c == '\n') break;
+    if (c == '\t')
+    {
+      int spaces = TAB_WIDTH - (ctx->n % TAB_WIDTH);
+      while (spaces-- > 0 && ctx->n < ctx->max) ctx->out[ctx->n++] = L' ';
+    }
+    else if (c < 32)
+      ctx->out[ctx->n++] = L' ';
+    else
+      ctx->out[ctx->n++] = (WCHAR)c;
+  }
+}
+
+static int line_to_wide_visible(Document *doc, u64 start, u64 end, u64 fc, int max_cols, WCHAR *out)
+{
+  if (start >= end) return 0;
+  VisibleCtx ctx = { fc, out, 0, max_cols };
+  doc_read_range(doc, start, end - start, visible_span, &ctx);
+  return ctx.n;
+}
+
+static void paint_editor(App *app, HDC dc)
+{
+  RECT rc;
+  GetClientRect(app->hwnd, &rc);
+  FillRect(dc, &rc, app->bg_brush);
+  RECT gutter = rc;
+  gutter.right = app->gutter_w;
+  HBRUSH gutter_bg = CreateSolidBrush(THEME_GUTTER_BG);
+  FillRect(dc, &gutter, gutter_bg);
+  DeleteObject(gutter_bg);
+  SelectObject(dc, app->font);
+  SetBkMode(dc, TRANSPARENT);
+  int max_cols = app->cols + 2;
+  if (max_cols > MAX_PAINT_COLS - 1) max_cols = MAX_PAINT_COLS - 1;
+  WCHAR text_buf[MAX_PAINT_COLS];
+  WCHAR num_buf[32];
+  int text_left = app->gutter_w + EDIT_TEXT_LEFT_PADDING;
+  HBRUSH active_line_brush = CreateSolidBrush(THEME_GUTTER_ACTIVE_LINE_BG);
+  HBRUSH selection_brush = CreateSolidBrush(THEME_SELECTION_BG);
+  doc_discover_for_view(&app->doc, app->tl, (u64)app->rows);
+  for (int row = 0; row < app->rows; ++row)
+  {
+    u64 line = app->tl + (u64)row;
+    int y = row * app->line_h;
+    if (line < app->doc.lines.count)
+    {
+      if (line == app->cl && active_line_brush)
+      {
+        RECT line_rc;
+        line_rc.left = 0;
+        line_rc.top = y;
+        line_rc.right = app->gutter_w - EDIT_LINE_NUMBER_RIGHT_PADDING;
+        line_rc.bottom = y + app->line_h;
+        FillRect(dc, &line_rc, active_line_brush);
+      }
+      SetTextColor(dc, THEME_GUTTER_FG);
+      int gutter_chars = digit_count_u64(doc_known_line_count(&app->doc));
+      if (gutter_chars < 1) gutter_chars = 1;
+      wfmt(num_buf, _countof(num_buf), L"%*llu", gutter_chars, (unsigned long long)(line + 1));
+      TextOutW(dc, EDIT_LINE_NUMBER_LEFT_PADDING, y, num_buf, lstrlenW(num_buf));
+      u64 start = line_index_start_at(&app->doc.lines, line);
+      u64 end = app->doc.len;
+      if (line + 1 < app->doc.lines.count)
+      {
+        end = line_index_start_at(&app->doc.lines, line + 1);
+        while (end > start)
+        {
+          char c = 0;
+          CopyCtx ctx = { &c, 0 };
+          doc_read_range(&app->doc, end - 1, 1, copy_span, &ctx);
+          if (c != '\n' && c != '\r') break;
+          --end;
+        }
+      }
+      int n = line_to_wide_visible(&app->doc, start, end, app->fc, max_cols, text_buf);
+      SetTextColor(dc, THEME_TEXT);
+      if (n > 0) TextOutW(dc, text_left, y, text_buf, n);
+      if (has_stream_selection(app))
+      {
+        u64 sel_start = min_u64(app->sa, app->sv);
+        u64 sel_end = max_u64(app->sa, app->sv);
+        u64 draw_start = max_u64(sel_start, start);
+        u64 draw_end = min_u64(sel_end, end);
+        if (draw_end > draw_start)
+        {
+          u64 col_start = draw_start - start;
+          u64 col_end = draw_end - start;
+          if (col_end > app->fc)
+          {
+            int vis_start = (int)(col_start > app->fc ? col_start - app->fc : 0);
+            int vis_end = (int)(col_end - app->fc);
+            if (vis_start < 0) vis_start = 0;
+            if (vis_end > n) vis_end = n;
+            if (vis_end > vis_start)
+            {
+              RECT sel_rc;
+              sel_rc.left = text_left + vis_start * app->char_w;
+              sel_rc.right = text_left + vis_end * app->char_w;
+              sel_rc.top = y;
+              sel_rc.bottom = y + app->line_h;
+              FillRect(dc, &sel_rc, selection_brush);
+              SetTextColor(dc, THEME_SELECTION_TEXT);
+              TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, vis_end - vis_start);
+              SetTextColor(dc, THEME_TEXT);
+            }
+          }
+        }
+      }
+      if (has_box_selection(app))
+      {
+        u64 top, bottom, left, right;
+        box_selection_bounds(app, &top, &bottom, &left, &right);
+        if (line >= top && line <= bottom && right > left)
+        {
+          int vis_start = 0;
+          int vis_end = 0;
+          if (right > app->fc)
+          {
+            vis_start = (int)(left > app->fc ? left - app->fc : 0);
+            vis_end = (int)(right - app->fc);
+            if (vis_start < 0) vis_start = 0;
+            if (vis_end > max_cols) vis_end = max_cols;
+            if (vis_end > vis_start)
+            {
+              RECT sel_rc;
+              sel_rc.left = text_left + vis_start * app->char_w;
+              sel_rc.right = text_left + vis_end * app->char_w;
+              sel_rc.top = y;
+              sel_rc.bottom = y + app->line_h;
+              FillRect(dc, &sel_rc, selection_brush);
+              if (vis_start < n)
+              {
+                int text_vis_end = vis_end;
+                if (text_vis_end > n) text_vis_end = n;
+                if (text_vis_end > vis_start)
+                {
+                  SetTextColor(dc, THEME_SELECTION_TEXT);
+                  TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, text_vis_end - vis_start);
+                  SetTextColor(dc, THEME_TEXT);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (active_line_brush) DeleteObject(active_line_brush);
+  if (selection_brush) DeleteObject(selection_brush);
+}
+
+
 
 /******************************************************************************
  * View / Caret / Scroll
@@ -1451,6 +1842,10 @@ static void update_title(App *app)
 
 static void update_scrollbars(App *app)
 {
+  LONG_PTR style;
+  bool has_vscroll;
+  bool has_hscroll;
+  u64 tl_before = app->tl;
   u64 known_lines = app->lcp
                     ? (app->doc.lines.count ? app->doc.lines.count : 1)
                     : doc_known_line_count(&app->doc);
@@ -1484,12 +1879,18 @@ static void update_scrollbars(App *app)
     if (app->cols < 1) app->cols = 1;
   }
   SCROLLINFO si;
+  style = GetWindowLongPtrW(app->hwnd, GWL_STYLE);
+  has_vscroll = (style & WS_VSCROLL) != 0;
+  has_hscroll = (style & WS_HSCROLL) != 0;
   if (app->lcp)
-    ShowScrollBar(app->hwnd, SB_VERT, FALSE);
+  {
+    if (has_vscroll) ShowScrollBar(app->hwnd, SB_VERT, FALSE);
+  }
   else
   {
     bool need_vscroll = known_lines > page;
-    ShowScrollBar(app->hwnd, SB_VERT, need_vscroll);
+    if (need_vscroll != has_vscroll)
+      ShowScrollBar(app->hwnd, SB_VERT, need_vscroll);
     memset(&si, 0, sizeof(si));
     si.cbSize = sizeof(si);
     si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
@@ -1501,13 +1902,16 @@ static void update_scrollbars(App *app)
   }
   {
     int page_cols = app->cols > 0 ? app->cols : 1;
+    u64 probe_rows = (u64)(app->rows > 0 ? app->rows : 1) + 1;
     u64 max_line_cols = 1;
     u64 first_visible_line = app->tl;
-    u64 last_visible_line = app->tl + (u64)(app->rows > 0 ? app->rows : 1);
+    /* Probe one extra row so h-scroll visibility remains stable when toggling
+     the bar itself changes viewport height by a row. */
+    u64 last_visible_line = app->tl + probe_rows;
     for (u64 line = first_visible_line; line < last_visible_line && line < app->doc.lines.count; ++line)
     {
-      u64 start = app->doc.lines.starts[line];
-      u64 end = (line + 1 < app->doc.lines.count) ? app->doc.lines.starts[line + 1] : app->doc.len;
+      u64 start = line_index_start_at(&app->doc.lines, line);
+      u64 end = (line + 1 < app->doc.lines.count) ? line_index_start_at(&app->doc.lines, line + 1) : app->doc.len;
       while (end > start)
       {
         char c = 0;
@@ -1524,7 +1928,8 @@ static void update_scrollbars(App *app)
     }
     {
       bool need_hscroll = max_line_cols > (u64)page_cols;
-      ShowScrollBar(app->hwnd, SB_HORZ, need_hscroll);
+      if (need_hscroll != has_hscroll)
+        ShowScrollBar(app->hwnd, SB_HORZ, need_hscroll);
       if (!need_hscroll) app->fc = 0;
       memset(&si, 0, sizeof(si));
       si.cbSize = sizeof(si);
@@ -1536,6 +1941,9 @@ static void update_scrollbars(App *app)
       SetScrollInfo(app->hwnd, SB_HORZ, &si, TRUE);
     }
   }
+  repro_log_scrollbar((unsigned long long)tl_before, (unsigned long long)app->tl,
+                      (unsigned long long)known_lines, (unsigned long long)page,
+                      (unsigned long long)max_top, app->doc.lines.eof, app->vsb);
 }
 
 static bool doc_discover_step(Document *doc, u64 budget)
@@ -1628,6 +2036,22 @@ static void apply_caret_line_metrics(App *app)
   }
 }
 
+static void preserve_caret_row_for_scroll(App *app, u64 old_top_line)
+{
+  u64 bottom_visible;
+  (void)old_top_line;
+  if (app->rows <= 0)
+  {
+    set_caret_line_col(app, app->tl, app->cc);
+    return;
+  }
+  bottom_visible = app->tl + (u64)app->rows - 1;
+  if (app->cl < app->tl)
+    set_caret_line_col(app, app->tl, app->cc);
+  else if (app->cl > bottom_visible)
+    set_caret_line_col(app, bottom_visible, app->cc);
+}
+
 static void keep_caret_visible(App *app)
 {
   if (app->cl < app->tl) app->tl = app->cl;
@@ -1638,17 +2062,37 @@ static void keep_caret_visible(App *app)
     app->fc = app->cc - (u64)app->cols + 1;
 }
 
+static void clamp_caret_to_horizontal_view(App *app)
+{
+  u64 last_visible_col;
+  if (app->cols <= 0) return;
+  last_visible_col = app->fc + (u64)app->cols - 1;
+  if (app->cc < app->fc)
+    set_caret_line_col(app, app->cl, app->fc);
+  else if (app->cc > last_visible_col)
+    set_caret_line_col(app, app->cl, last_visible_col);
+}
+
 static void position_caret(App *app)
 {
   if (GetFocus() != app->hwnd) return;
   ensure_caret_shape(app);
   update_scrollbars(app);
-  keep_caret_visible(app);
+  if (app->skip_keep_caret_visible_once)
+    app->skip_keep_caret_visible_once = false;
+  else
+    keep_caret_visible(app);
   u64 visual_line = app->cl;
   if (app->bsa)
     visual_line = app->bal < app->bcl ? app->bal : app->bcl;
   int row = (int)(visual_line - app->tl);
-  int col = (int)(app->cc - app->fc);
+  int col;
+  if (app->cc < app->fc)
+    col = 0;
+  else if (app->cc >= app->fc + (u64)app->cols)
+    col = app->cols > 0 ? app->cols - 1 : 0;
+  else
+    col = (int)(app->cc - app->fc);
   int x = app->gutter_w + EDIT_TEXT_LEFT_PADDING + col * app->char_w;
   int y = row * app->line_h;
   SetCaretPos(x, y);
@@ -1659,6 +2103,34 @@ static void request_repaint(App *app, BOOL erase)
 {
   InvalidateRect(app->hwnd, NULL, erase);
   position_caret(app);
+}
+
+static void force_focus_window(HWND hwnd)
+{
+  HWND foreground;
+  DWORD current_tid;
+  DWORD target_tid;
+  DWORD foreground_tid;
+  BOOL attached_to_target = FALSE;
+  BOOL attached_to_foreground = FALSE;
+  if (!hwnd || !IsWindow(hwnd)) return;
+  current_tid = GetCurrentThreadId();
+  target_tid = GetWindowThreadProcessId(hwnd, NULL);
+  foreground = GetForegroundWindow();
+  foreground_tid = foreground ? GetWindowThreadProcessId(foreground, NULL) : 0;
+  if (target_tid && target_tid != current_tid)
+    attached_to_target = AttachThreadInput(current_tid, target_tid, TRUE);
+  if (foreground_tid && foreground_tid != current_tid && foreground_tid != target_tid)
+    attached_to_foreground = AttachThreadInput(current_tid, foreground_tid, TRUE);
+  ShowWindow(hwnd, SW_SHOW);
+  BringWindowToTop(hwnd);
+  SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  SetForegroundWindow(hwnd);
+  SetActiveWindow(hwnd);
+  SetFocus(hwnd);
+  if (attached_to_foreground) AttachThreadInput(current_tid, foreground_tid, FALSE);
+  if (attached_to_target) AttachThreadInput(current_tid, target_tid, FALSE);
 }
 
 static void keep_visible_and_repaint(App *app)
@@ -1700,6 +2172,13 @@ static void clear_stream_selection(App *app)
   app->sa = app->co;
   app->sv = app->co;
   clear_box_selection(app);
+}
+
+static void collapse_stream_selection_to_caret(App *app)
+{
+  if (!app) return;
+  app->sa = app->co;
+  app->sv = app->co;
 }
 
 static void sync_caret_from_offsets(App *app)
@@ -1763,6 +2242,76 @@ static bool app_insert_spaces(App *app, u64 off, u64 count)
     count -= chunk;
   }
   return true;
+}
+
+static u64 app_remove_line_indent(App *app, u64 line)
+{
+  char prefix[2] = {0, 0};
+  CopyCtx ctx = {prefix, 0};
+  u64 line_off = doc_line_start(&app->doc, line);
+  u64 remove = 0;
+  if (line_off >= app->doc.len) return 0;
+  doc_read_range(&app->doc, line_off, min_u64(2, app->doc.len - line_off), copy_span, &ctx);
+  if (prefix[0] == ' ') remove++;
+  if (prefix[0] == ' ' && prefix[1] == ' ') remove++;
+  if (remove > 0 && app_doc_delete(app, line_off, remove)) return remove;
+  return 0;
+}
+
+static u64 app_remove_spaces_at_column(App *app, u64 line, u64 col)
+{
+  u64 line_off = doc_line_start(&app->doc, line);
+  u64 line_end = doc_line_length_clamped(&app->doc, line_off, UINT32_MAX);
+  u64 line_len = line_end - line_off;
+  if (col >= line_len) return 0;
+
+  char probe[2] = {0, 0};
+  CopyCtx ctx = {probe, 0};
+  u64 remove = 0;
+  u64 at = line_off + col;
+  doc_read_range(&app->doc, at, min_u64(2, line_len - col), copy_span, &ctx);
+  if (probe[0] == ' ') remove++;
+  if (probe[0] == ' ' && probe[1] == ' ') remove++;
+  if (remove > 0 && app_doc_delete(app, at, remove)) return remove;
+  return 0;
+}
+
+static u64 app_remove_spaces_near_caret(App *app, u64 *caret_io)
+{
+  u64 caret = *caret_io;
+  u64 removed = 0;
+  for (int stage = 0; stage < 2; ++stage)
+  {
+    bool removed_this_stage = false;
+    if (caret > 0)
+    {
+      char left = 0;
+      CopyCtx left_ctx = {&left, 0};
+      doc_read_range(&app->doc, caret - 1, 1, copy_span, &left_ctx);
+      if (left == ' ')
+      {
+        if (app_doc_delete(app, caret - 1, 1))
+        {
+          caret--;
+          removed++;
+          removed_this_stage = true;
+        }
+      }
+    }
+    if (!removed_this_stage && caret < app->doc.len)
+    {
+      char right = 0;
+      CopyCtx right_ctx = {&right, 0};
+      doc_read_range(&app->doc, caret, 1, copy_span, &right_ctx);
+      if (right == ' ')
+      {
+        if (app_doc_delete(app, caret, 1))
+          removed++;
+      }
+    }
+  }
+  *caret_io = caret;
+  return removed;
 }
 
 static bool apply_basic_edit(App *app, const char *insert_text, u64 insert_len, bool delete_backspace, bool delete_forward)
@@ -1916,87 +2465,6 @@ static bool apply_box_paste_multiline(App *app, const char *insert_text, u64 ins
   return changed;
 }
 
-static bool apply_caret_multiline_paste(App *app, const char *insert_text, u64 insert_len)
-{
-  u64 seg_count = 1;
-  const char **seg_ptrs = NULL;
-  u64 *seg_lens = NULL;
-  bool changed = false;
-  u64 base_line;
-  u64 base_col;
-  if (!insert_text || insert_len == 0) return false;
-  for (u64 i = 0; i < insert_len; ++i)
-    if (insert_text[i] == '\n')
-      seg_count++;
-  if (seg_count <= 1) return false;
-
-  seg_ptrs = (const char **)malloc(sizeof(*seg_ptrs) * (size_t)seg_count);
-  seg_lens = (u64 *)malloc(sizeof(*seg_lens) * (size_t)seg_count);
-  if (!seg_ptrs || !seg_lens)
-  {
-    free(seg_ptrs);
-    free(seg_lens);
-    return false;
-  }
-
-  {
-    u64 seg_i = 0;
-    u64 start = 0;
-    for (u64 i = 0; i <= insert_len; ++i)
-    {
-      if (i == insert_len || insert_text[i] == '\n')
-      {
-        u64 len = i - start;
-        if (len > 0 && insert_text[start + len - 1] == '\r') len--;
-        seg_ptrs[seg_i] = insert_text + start;
-        seg_lens[seg_i] = len;
-        seg_i++;
-        start = i + 1;
-      }
-    }
-  }
-
-  base_line = app->cl;
-  base_col = app->cc;
-
-  doc_ensure_line(&app->doc, base_line);
-  while (app->doc.lines.count <= base_line + seg_count - 1)
-  {
-    if (!app_doc_insert(app, app->doc.len, "\n", 1))
-      break;
-    changed = true;
-    doc_ensure_line(&app->doc, base_line + seg_count - 1);
-  }
-
-  for (u64 seg_index = seg_count; seg_index-- > 0;)
-  {
-    u64 line = base_line + seg_index;
-    u64 ls = doc_line_start(&app->doc, line);
-    u64 le = doc_line_length_clamped(&app->doc, ls, UINT32_MAX);
-    u64 ll = le - ls;
-    if (ll < base_col)
-    {
-      if (!app_insert_spaces(app, ls + ll, base_col - ll))
-        continue;
-      changed = true;
-    }
-    if (seg_lens[seg_index] > 0)
-    {
-      if (app_doc_insert(app, ls + base_col, seg_ptrs[seg_index], seg_lens[seg_index]))
-        changed = true;
-    }
-  }
-
-  if (changed)
-  {
-    update_title(app);
-    set_caret_line_col(app, base_line, base_col + seg_lens[0]);
-  }
-  free(seg_ptrs);
-  free(seg_lens);
-  return changed;
-}
-
 static bool extend_box_selection(App *app, WPARAM key)
 {
   u64 line;
@@ -2020,6 +2488,7 @@ static bool extend_box_selection(App *app, WPARAM key)
     app->bsa = true;
     app->bal = app->cl;
     app->bac = app->cc;
+    collapse_stream_selection_to_caret(app);
   }
   switch (key)
   {
@@ -2052,11 +2521,1217 @@ static bool extend_box_selection(App *app, WPARAM key)
   }
   app->bcl = app->cl;
   app->bdc = desired_col;
+  collapse_stream_selection_to_caret(app);
   if (app->bal == app->bcl &&
       app->bac == app->bcc)
     clear_box_selection(app);
   return true;
 }
+
+static char *trim_ascii(char *s)
+{
+  char *end;
+  while (*s == ' ' || *s == '\t') ++s;
+  end = s + strlen(s);
+  while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n'))
+    *--end = 0;
+  return s;
+}
+
+static void command_popup_update_matches(App *app)
+{
+  int prev_sel = LB_ERR;
+  int i;
+  if (!app->cmd_list) return;
+  prev_sel = (int)SendMessageW(app->cmd_list, LB_GETCURSEL, 0, 0);
+  app->cmd_match_count = 0;
+  SendMessageW(app->cmd_list, LB_RESETCONTENT, 0, 0);
+  for (i = 0; i < app->cmd_entry_count; ++i)
+  {
+    const WCHAR *first = app->cmd_entries[i].first;
+    size_t qlen = wcslen(app->cmd_query);
+    if (qlen != 0 && _wcsnicmp(first, app->cmd_query, qlen) != 0) continue;
+    if (app->cmd_match_count < MAX_DO_COMMANDS)
+    {
+      app->cmd_match_indices[app->cmd_match_count] = i;
+      SendMessageW(app->cmd_list, LB_ADDSTRING, 0, (LPARAM)app->cmd_entries[i].display);
+      app->cmd_match_count++;
+    }
+  }
+  if (app->cmd_match_count > 0)
+  {
+    int sel = prev_sel;
+    if (sel < 0 || sel >= app->cmd_match_count) sel = 0;
+    SendMessageW(app->cmd_list, LB_SETCURSEL, (WPARAM)sel, 0);
+  }
+  InvalidateRect(app->cmd_edit, NULL, TRUE);
+}
+
+static bool load_do_commands(App *app)
+{
+  FILE *f = NULL;
+  char line[512];
+  WCHAR exe_path[MAX_PATH];
+  WCHAR cmd_path[MAX_PATH];
+  WCHAR *slash = NULL;
+  DWORD exe_len = 0;
+  app->cmd_entry_count = 0;
+  exe_len = GetModuleFileNameW(NULL, exe_path, (DWORD)_countof(exe_path));
+  if (exe_len == 0 || exe_len >= (DWORD)_countof(exe_path)) return false;
+  wcs_copy_trunc(cmd_path, _countof(cmd_path), exe_path);
+  slash = wcsrchr(cmd_path, L'\\');
+  if (!slash) slash = wcsrchr(cmd_path, L'/');
+  if (!slash) return false;
+  slash[1] = 0;
+  wcs_cat_trunc(cmd_path, _countof(cmd_path), L"doCommands.txt");
+  if (_wfopen_s(&f, cmd_path, L"rb") != 0) f = NULL;
+  if (!f) return false;
+  while (fgets(line, (int)sizeof(line), f))
+  {
+    char *first;
+    char *second;
+    char *third;
+    DoCommandEntry *entry;
+    if (app->cmd_entry_count >= MAX_DO_COMMANDS) break;
+    first = trim_ascii(line);
+    if (!*first) continue;
+    second = strchr(first, ':');
+    if (!second) continue;
+    *second++ = 0;
+    third = strchr(second, ':');
+    if (third) *third = 0;
+    first = trim_ascii(first);
+    second = trim_ascii(second);
+    if (!*first) continue;
+    entry = &app->cmd_entries[app->cmd_entry_count];
+    MultiByteToWideChar(CP_UTF8, 0, first, -1, entry->first, (int)_countof(entry->first));
+    MultiByteToWideChar(CP_UTF8, 0, second, -1, entry->second, (int)_countof(entry->second));
+    if (entry->second[0])
+      wfmt(entry->display, _countof(entry->display), L"%ls (%ls)", entry->first, entry->second);
+    else
+      wfmt(entry->display, _countof(entry->display), L"%ls", entry->first);
+    app->cmd_entry_count++;
+  }
+  fclose(f);
+  return app->cmd_entry_count > 0;
+}
+
+static void command_popup_move_selection(App *app, int delta)
+{
+  int sel;
+  if (!app->cmd_list || app->cmd_match_count <= 0) return;
+  sel = (int)SendMessageW(app->cmd_list, LB_GETCURSEL, 0, 0);
+  if (sel == LB_ERR) sel = 0;
+  sel += delta;
+  if (sel < 0) sel = app->cmd_match_count - 1;
+  if (sel >= app->cmd_match_count) sel = 0;
+  SendMessageW(app->cmd_list, LB_SETCURSEL, (WPARAM)sel, 0);
+  InvalidateRect(app->cmd_edit, NULL, TRUE);
+}
+
+static bool command_popup_get_completion(App *app, WCHAR *out, size_t out_count)
+{
+  int sel;
+  int idx;
+  if (!out || out_count == 0) return false;
+  out[0] = 0;
+  if (!app->cmd_list || app->cmd_match_count <= 0) return false;
+  sel = (int)SendMessageW(app->cmd_list, LB_GETCURSEL, 0, 0);
+  if (sel == LB_ERR) sel = 0;
+  if (sel < 0 || sel >= app->cmd_match_count) return false;
+  idx = app->cmd_match_indices[sel];
+  wcs_copy_n_trunc(out, out_count, app->cmd_entries[idx].first, (size_t)-1);
+  return true;
+}
+
+static void command_edit_delete_previous_word(HWND hwnd)
+{
+  DWORD start = 0;
+  DWORD end = 0;
+  WCHAR text[128];
+  int len;
+  int pos;
+  int cut;
+  SendMessageW(hwnd, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+  if (start != end)
+  {
+    SendMessageW(hwnd, WM_CLEAR, 0, 0);
+    return;
+  }
+  len = GetWindowTextW(hwnd, text, (int)_countof(text));
+  if (len <= 0 || start == 0) return;
+  if (start > (DWORD)len) start = (DWORD)len;
+  pos = (int)start;
+  cut = pos;
+  while (cut > 0 && iswspace((wint_t)text[cut - 1])) cut--;
+  while (cut > 0 && !iswspace((wint_t)text[cut - 1])) cut--;
+  if (cut == pos) return;
+  SendMessageW(hwnd, EM_SETSEL, (WPARAM)cut, (LPARAM)pos);
+  SendMessageW(hwnd, WM_CLEAR, 0, 0);
+}
+
+static bool is_ctrl_backspace_char_message(WPARAM wp)
+{
+  return wp == 0x7F;
+}
+
+static LRESULT CALLBACK command_edit_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+  App *app = &g_app;
+  if (msg == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
+  if (msg == WM_KEYDOWN)
+  {
+    if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_BACK)
+    {
+      command_edit_delete_previous_word(hwnd);
+      return 0;
+    }
+    if (wp == VK_UP) { command_popup_move_selection(app, -1); return 0; }
+    if (wp == VK_DOWN) { command_popup_move_selection(app, 1); return 0; }
+    if (wp == VK_RETURN) { close_command_popup(app); return 0; }
+    if (wp == VK_TAB) { close_command_popup(app); return 0; }
+    if (wp == VK_ESCAPE) { close_command_popup(app); return 0; }
+  }
+  if (msg == WM_CHAR)
+  {
+    if (((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_BACK) || is_ctrl_backspace_char_message(wp)) return 0;
+    if (wp == VK_RETURN || wp == VK_TAB || wp == VK_ESCAPE) return 0;
+  }
+  if (msg == WM_PAINT && app->cmd_edit == hwnd)
+  {
+    LRESULT r = CallWindowProcW(g_command_edit_wndproc, hwnd, msg, wp, lp);
+    {
+      WCHAR typed[128];
+      WCHAR completion[64];
+      size_t typed_len;
+      size_t comp_len;
+      if (GetWindowTextW(hwnd, typed, (int)_countof(typed)) <= 0) return r;
+      if (!command_popup_get_completion(app, completion, _countof(completion))) return r;
+      typed_len = wcslen(typed);
+      comp_len = wcslen(completion);
+      if (typed_len < comp_len && _wcsnicmp(completion, typed, typed_len) == 0)
+      {
+        HDC dc = GetDC(hwnd);
+        if (dc)
+        {
+          HFONT font = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0);
+          HFONT old_font = NULL;
+          RECT rc;
+          SIZE sz = { 0, 0 };
+          DWORD margins = (DWORD)SendMessageW(hwnd, EM_GETMARGINS, 0, 0);
+          int left = LOWORD(margins);
+          if (font) old_font = (HFONT)SelectObject(dc, font);
+          GetClientRect(hwnd, &rc);
+          GetTextExtentPoint32W(dc, typed, (int)typed_len, &sz);
+          SetBkMode(dc, TRANSPARENT);
+          SetTextColor(dc, RGB(135, 135, 135));
+          TextOutW(dc, left + 1 + sz.cx, (rc.bottom - rc.top - app->line_h) / 2,
+                   completion + typed_len, (int)(comp_len - typed_len));
+          if (old_font) SelectObject(dc, old_font);
+          ReleaseDC(hwnd, dc);
+        }
+      }
+    }
+    return r;
+  }
+  return CallWindowProcW(g_command_edit_wndproc, hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK command_popup_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+  App *app = &g_app;
+  switch (msg)
+  {
+  case WM_ERASEBKGND:
+  {
+    RECT rc;
+    HDC dc = (HDC)wp;
+    if (dc && GetClientRect(hwnd, &rc))
+    {
+      FillRect(dc, &rc, app->cmd_bg_brush ? app->cmd_bg_brush : (app->bg_brush ? app->bg_brush : (HBRUSH)(COLOR_WINDOW + 1)));
+      return 1;
+    }
+    break;
+  }
+  case WM_CREATE:
+  {
+    app->cmd_edit = CreateWindowExW(0, L"EDIT", L"",
+                                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                    8, 8, 344, 28, hwnd, (HMENU)(INT_PTR)IDC_CMD_EDIT, GetModuleHandleW(NULL), NULL);
+    app->cmd_list = CreateWindowExW(0, L"LISTBOX", L"",
+                                    WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY,
+                                    8, 42, 344, 120, hwnd, (HMENU)(INT_PTR)IDC_CMD_LIST, GetModuleHandleW(NULL), NULL);
+    if (app->font)
+    {
+      SendMessageW(app->cmd_edit, WM_SETFONT, (WPARAM)app->font, TRUE);
+      SendMessageW(app->cmd_list, WM_SETFONT, (WPARAM)app->font, TRUE);
+    }
+    g_command_edit_wndproc = (WNDPROC)SetWindowLongPtrW(app->cmd_edit, GWLP_WNDPROC, (LONG_PTR)command_edit_wndproc);
+    SetFocus(app->cmd_edit);
+    return 0;
+  }
+  case WM_SIZE:
+  {
+    int w = LOWORD(lp);
+    int h = HIWORD(lp);
+    if (app->cmd_edit) MoveWindow(app->cmd_edit, 8, 8, w - 16, 28, TRUE);
+    if (app->cmd_list) MoveWindow(app->cmd_list, 8, 42, w - 16, h - 50, TRUE);
+    return 0;
+  }
+  case WM_PAINT:
+  {
+    PAINTSTRUCT ps;
+    RECT rc;
+    BeginPaint(hwnd, &ps);
+    if (GetClientRect(hwnd, &rc))
+      FillRect(ps.hdc, &rc, app->cmd_bg_brush ? app->cmd_bg_brush : (app->bg_brush ? app->bg_brush : (HBRUSH)(COLOR_WINDOW + 1)));
+    EndPaint(hwnd, &ps);
+    return 0;
+  }
+  case WM_ACTIVATE:
+    if (LOWORD(wp) == WA_INACTIVE)
+    {
+      DestroyWindow(hwnd);
+      return 0;
+    }
+    break;
+  case WM_COMMAND:
+    if (LOWORD(wp) == IDC_CMD_EDIT && HIWORD(wp) == EN_CHANGE)
+    {
+      GetWindowTextW(app->cmd_edit, app->cmd_query, (int)_countof(app->cmd_query));
+      command_popup_update_matches(app);
+      return 0;
+    }
+    if (LOWORD(wp) == IDC_CMD_LIST && HIWORD(wp) == LBN_DBLCLK)
+    {
+      close_command_popup(app);
+      return 0;
+    }
+    break;
+  case WM_CTLCOLORLISTBOX:
+  case WM_CTLCOLOREDIT:
+  case WM_CTLCOLORSTATIC:
+  {
+    HDC dc = (HDC)wp;
+    SetTextColor(dc, THEME_TEXT);
+    SetBkColor(dc, THEME_CMD_POPUP_BG);
+    return (LRESULT)(app->cmd_bg_brush ? app->cmd_bg_brush : app->bg_brush);
+  }
+  case WM_CLOSE:
+    DestroyWindow(hwnd);
+    return 0;
+  case WM_DESTROY:
+    if (app->cmd_hwnd == hwnd)
+    {
+      HWND owner = GetWindow(hwnd, GW_OWNER);
+      if (!owner) owner = app->hwnd;
+      app->cmd_hwnd = NULL;
+      app->cmd_edit = NULL;
+      app->cmd_list = NULL;
+      if (owner && IsWindow(owner))
+      {
+        PostMessageW(owner, WM_APP_RESTORE_EDITOR_FOCUS, 0, 0);
+      }
+    }
+    return 0;
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void close_command_popup(App *app)
+{
+  if (app->cmd_hwnd && IsWindow(app->cmd_hwnd))
+    DestroyWindow(app->cmd_hwnd);
+}
+
+static void open_command_popup(App *app)
+{
+  RECT rc = { 0 };
+  POINT p = { 0 };
+  int x = 40;
+  int y = 40;
+  int w = 360;
+  int h = 180;
+  if (app->cmd_hwnd && IsWindow(app->cmd_hwnd))
+  {
+    SetForegroundWindow(app->cmd_hwnd);
+    SetFocus(app->cmd_edit);
+    return;
+  }
+  if (!load_do_commands(app))
+  {
+    MessageBoxW(app->hwnd, L"Could not load doCommands.txt.", L"text", MB_ICONERROR | MB_OK);
+    return;
+  }
+  app->cmd_query[0] = 0;
+  app->cmd_restore_pending = true;
+  app->cmd_saved_co = app->co;
+  app->cmd_saved_sa = app->sa;
+  app->cmd_saved_sv = app->sv;
+  if (GetCaretPos(&p))
+  {
+    ClientToScreen(app->hwnd, &p);
+    x = p.x - 9;
+    y = p.y - 8;
+  }
+  else if (GetClientRect(app->hwnd, &rc))
+  {
+    p.x = app->gutter_w + EDIT_TEXT_LEFT_PADDING + (int)((app->cc - app->fc) * (u64)app->char_w);
+    p.y = (int)((app->cl - app->tl) * (u64)app->line_h);
+    if (p.x < 0) p.x = 0;
+    if (p.y < 0) p.y = 0;
+    ClientToScreen(app->hwnd, &p);
+    x = p.x;
+    y = p.y;
+  }
+  app->cmd_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, CMD_POPUP_CLASS_NAME, L"do",
+                                  WS_POPUP,
+                                  x, y, w, h, app->hwnd, NULL, GetModuleHandleW(NULL), NULL);
+  if (!app->cmd_hwnd)
+  {
+    app->cmd_restore_pending = false;
+    return;
+  }
+  ShowWindow(app->cmd_hwnd, SW_SHOW);
+  UpdateWindow(app->cmd_hwnd);
+  command_popup_update_matches(app);
+}
+
+static void find_result_preview(Document *doc, u64 line, WCHAR *out, size_t out_count)
+{
+  u64 start;
+  u64 end;
+  u64 len;
+  char buf[120];
+  CopyCtx ctx = { buf, 0 };
+  int wlen;
+  if (!out || out_count == 0)
+    return;
+  out[0] = 0;
+  if (!doc || out_count < 2) return;
+  start = doc_line_start(doc, line);
+  end = (line + 1 < doc->lines.count) ? doc_line_start(doc, line + 1) : doc->len;
+  while (end > start)
+  {
+    char tail[2] = { 0, 0 };
+    CopyCtx tail_ctx = { tail, 0 };
+    doc_read_range(doc, end - 1, 1, copy_span, &tail_ctx);
+    if (tail[0] == '\n' || tail[0] == '\r') end--;
+    else break;
+  }
+  len = min_u64(end - start, (u64)(sizeof(buf) - 1));
+  memset(buf, 0, sizeof(buf));
+  if (len > 0) doc_read_range(doc, start, len, copy_span, &ctx);
+  buf[ctx.at] = 0;
+  wlen = MultiByteToWideChar(CP_UTF8, 0, buf, -1, out, (int)out_count);
+  if (wlen <= 0)
+    out[0] = 0;
+}
+
+static void find_popup_select_result(App *app, int index)
+{
+  FindResult *result;
+  if (!app || index < 0 || index >= app->find_result_count) return;
+  result = &app->find_results[index];
+  app->find_selected_result = index;
+  app->sa = result->off;
+  app->sv = min_u64(result->off + result->len, app->doc.len);
+  app->co = app->sv;
+  doc_offset_to_line_col(&app->doc, app->co, &app->cl, &app->cc);
+  keep_visible_and_repaint(app);
+  if (app->find_list)
+  {
+    SendMessageW(app->find_list, LB_SETCURSEL, (WPARAM)index, 0);
+    SendMessageW(app->find_list, LB_SETTOPINDEX, (WPARAM)index, 0);
+  }
+}
+
+static void find_popup_activate_selected(App *app)
+{
+  int sel;
+  if (!app || app->find_result_count <= 0) return;
+  sel = (int)SendMessageW(app->find_list, LB_GETCURSEL, 0, 0);
+  if (sel == LB_ERR) sel = 0;
+  find_popup_select_result(app, sel);
+  if (sel + 1 < app->find_result_count)
+  {
+    SendMessageW(app->find_list, LB_SETCURSEL, (WPARAM)(sel + 1), 0);
+    SendMessageW(app->find_list, LB_SETTOPINDEX, (WPARAM)(sel + 1), 0);
+  }
+}
+
+static void find_popup_update_matches(App *app)
+{
+  int qbytes;
+  char *q = NULL;
+  char *hay = NULL;
+  u64 qlen;
+  u64 count = 0;
+  u64 i = 0;
+  WCHAR count_text[96];
+  if (!app || !app->find_list || !app->find_count_label) return;
+  app->find_result_count = 0;
+  app->find_selected_result = -1;
+  SendMessageW(app->find_list, LB_RESETCONTENT, 0, 0);
+  qbytes = WideCharToMultiByte(CP_UTF8, 0, app->fq, -1, NULL, 0, NULL, NULL);
+  if (qbytes <= 1 || app->doc.len == 0)
+  {
+    SetWindowTextW(app->find_count_label, L"0 entities found");
+    InvalidateRect(app->find_list, NULL, TRUE);
+    return;
+  }
+  q = (char *)malloc((size_t)qbytes);
+  hay = (char *)malloc((size_t)app->doc.len);
+  if (!q || !hay)
+  {
+    free(q);
+    free(hay);
+    SetWindowTextW(app->find_count_label, L"0 entities found");
+    return;
+  }
+  WideCharToMultiByte(CP_UTF8, 0, app->fq, -1, q, qbytes, NULL, NULL);
+  qlen = (u64)qbytes - 1;
+  {
+    SearchCtx sctx = { hay, 0 };
+    doc_read_range(&app->doc, 0, app->doc.len, append_span, &sctx);
+  }
+  while (i + qlen <= app->doc.len)
+  {
+    if (memcmp(hay + i, q, (size_t)qlen) == 0)
+    {
+      u64 line = 0;
+      u64 col = 0;
+      count++;
+      if (app->find_result_count < MAX_FIND_RESULTS)
+      {
+        FindResult *result = &app->find_results[app->find_result_count];
+        result->off = i;
+        result->len = qlen;
+        doc_offset_to_line_col(&app->doc, i, &line, &col);
+        result->line = line;
+        find_result_preview(&app->doc, line, result->preview, _countof(result->preview));
+        SendMessageW(app->find_list, LB_ADDSTRING, 0, (LPARAM)result->preview);
+        app->find_result_count++;
+      }
+      i += qlen;
+    }
+    else
+      i++;
+  }
+  wfmt(count_text, _countof(count_text), L"%llu entities found", (unsigned long long)count);
+  SetWindowTextW(app->find_count_label, count_text);
+  if (app->find_result_count > 0)
+  {
+    SendMessageW(app->find_list, LB_SETCURSEL, 0, 0);
+    find_popup_select_result(app, 0);
+    SendMessageW(app->find_list, LB_SETCURSEL, 1 < app->find_result_count ? 1 : 0, 0);
+  }
+  free(q);
+  free(hay);
+  InvalidateRect(app->find_list, NULL, TRUE);
+}
+
+static LRESULT CALLBACK find_popup_edit_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+  App *app = &g_app;
+  if (msg == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
+  if (msg == WM_KEYDOWN)
+  {
+    if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_BACK)
+    {
+      command_edit_delete_previous_word(hwnd);
+      return 0;
+    }
+    if (wp == VK_UP)
+    {
+      if (app->find_list) SendMessageW(app->find_list, WM_KEYDOWN, VK_UP, 0);
+      return 0;
+    }
+    if (wp == VK_DOWN)
+    {
+      if (app->find_list) SendMessageW(app->find_list, WM_KEYDOWN, VK_DOWN, 0);
+      return 0;
+    }
+    if (wp == VK_RETURN)
+    {
+      find_popup_activate_selected(app);
+      return 0;
+    }
+    if (wp == VK_ESCAPE)
+    {
+      close_find_popup(app);
+      return 0;
+    }
+  }
+  if (msg == WM_CHAR)
+  {
+    if (((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_BACK) || is_ctrl_backspace_char_message(wp)) return 0;
+    if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
+  }
+  return CallWindowProcW(g_find_popup_edit_wndproc, hwnd, msg, wp, lp);
+}
+
+
+
+/******************************************************************************
+ * Keyboard / Character Input
+ ******************************************************************************/
+static void handle_key(App *app, WPARAM vk)
+{
+  app->vsb = false;
+  bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+  bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  u64 old_off = app->co;
+  bool moved = false;
+  if (vk == VK_ESCAPE)
+  {
+    if (shift)
+    {
+      DestroyWindow(app->hwnd);
+      return;
+    }
+    if (app->find_hwnd && IsWindow(app->find_hwnd))
+      DestroyWindow(app->find_hwnd);
+    else
+      PostMessageW(app->hwnd, WM_CLOSE, 0, 0);
+    return;
+  }
+  if (ctrl && vk == 'O') { open_dialog(app); return; }
+  if (ctrl && !shift && vk == 'S') { save_dialog(app); return; }
+  if (ctrl && shift && vk == 'S') { save_as_dialog(app); return; }
+  if (ctrl && vk == 'C')
+  {
+    if (has_box_selection(app))
+    {
+      copy_box_selection_to_clipboard(app);
+      app->clm = false;
+    }
+    else if (has_stream_selection(app))
+    {
+      copy_selection_or_current_line_to_clipboard(app);
+      app->clm = false;
+    }
+    else
+    {
+      copy_current_line_to_clipboard(app);
+      app->clm = true;
+    }
+    return;
+  }
+  if (ctrl && vk == 'X')
+  {
+    if (has_box_selection(app))
+    {
+      begin_edit_txn(app);
+      copy_box_selection_to_clipboard(app);
+      app->clm = false;
+      if (apply_basic_edit(app, NULL, 0, false, false))
+      {
+        update_title(app);
+        request_repaint(app, FALSE);
+      }
+      end_edit_txn(app);
+      return;
+    }
+    if (has_stream_selection(app))
+    {
+      begin_edit_txn(app);
+      copy_selection_or_current_line_to_clipboard(app);
+      app->clm = false;
+      if (delete_selection(app))
+      {
+        update_title(app);
+        request_repaint(app, FALSE);
+      }
+    }
+    else
+    {
+      u64 start = 0;
+      u64 end = 0;
+      u64 old_col = app->cc;
+      if (current_line_range(app, &start, &end))
+      {
+        copy_current_line_to_clipboard(app);
+        app->clm = true;
+        begin_edit_txn(app);
+        app_doc_delete(app, start, end - start);
+        app->co = start;
+        app->sa = app->co;
+        app->sv = app->co;
+        sync_caret_from_offsets(app);
+        set_caret_line_col(app, app->cl, old_col);
+        keep_caret_visible(app);
+        update_title(app);
+        request_repaint(app, FALSE);
+      }
+    }
+    end_edit_txn(app);
+    return;
+  }
+  if (ctrl && vk == 'A')
+  {
+    app->sa = 0;
+    app->sv = app->doc.len;
+    app->co = app->doc.len;
+    sync_caret_from_offsets(app);
+    keep_visible_and_repaint(app);
+    return;
+  }
+  if (ctrl && !shift && vk == 'Z') { perform_undo(app); return; }
+  if ((ctrl && !shift && vk == 'Y') || (ctrl && shift && vk == 'Z')) { perform_redo(app); return; }
+  if (ctrl && !shift && !alt && vk == 'D') { open_command_popup(app); return; }
+  if (ctrl && alt && vk == 'D') { run_codex_do_command(app); return; }
+  if (ctrl && shift && vk == 'D')
+  {
+    if (app->doc.dirty)
+      save_dialog(app);
+    if (run_codex_do_command(app))
+      PostMessageW(app->hwnd, WM_CLOSE, 0, 0);
+    return;
+  }
+  if (ctrl && (vk == VK_OEM_MINUS || vk == VK_SUBTRACT)) { apply_font_size(app, app->font_size - 2); return; }
+  if (ctrl && (vk == VK_OEM_PLUS || vk == VK_ADD)) { apply_font_size(app, app->font_size + 2); return; }
+  if (ctrl && (vk == '0' || vk == VK_NUMPAD0)) { apply_font_size(app, FONT_SIZE_DEFAULT); return; }
+  if (ctrl && vk == 'V') { paste_clipboard(app); return; }
+  if (ctrl && vk == 'F')
+  {
+    seed_find_query_from_selection(app);
+    open_find_popup(app);
+    return;
+  }
+  if (vk == VK_F3) { find_next(app, app->fq); return; }
+  if (alt && !shift && (vk == VK_UP || vk == VK_DOWN))
+  {
+    if (move_caret_line_by_swap(app, vk == VK_DOWN))
+      update_title(app);
+    keep_visible_and_repaint(app);
+    return;
+  }
+  if (alt && shift &&
+      (vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT))
+  {
+    extend_box_selection(app, vk);
+    keep_visible_and_repaint(app);
+    return;
+  }
+  if (vk == VK_TAB && !has_stream_selection(app))
+  {
+    if (has_box_selection(app))
+    {
+      u64 top, bottom, left, right;
+      u64 line;
+      u64 removed_anchor = 0;
+      u64 removed_active = 0;
+      bool changed = false;
+      box_selection_bounds(app, &top, &bottom, &left, &right);
+      (void)left;
+      (void)right;
+      begin_edit_txn(app);
+      if (!shift)
+      {
+        for (line = 0; line <= bottom - top; ++line)
+        {
+          u64 line_off = doc_line_start(&app->doc, top + line);
+          u64 line_end = doc_line_length_clamped(&app->doc, line_off, UINT32_MAX);
+          u64 line_len = line_end - line_off;
+          if (line_len < left)
+          {
+            if (!app_insert_spaces(app, line_off + line_len, left - line_len))
+              continue;
+          }
+          if (app_doc_insert(app, line_off + left, "  ", 2))
+            changed = true;
+        }
+        if (changed)
+        {
+          app->bac += 2;
+          app->bcc += 2;
+          app->bdc += 2;
+        }
+      }
+      else
+      {
+        u64 remove_col = left >= 2 ? left - 2 : left;
+        for (line = 0; line <= bottom - top; ++line)
+        {
+          u64 current_line = top + line;
+          u64 removed = app_remove_spaces_at_column(app, current_line, remove_col);
+          if (current_line == app->bal) removed_anchor = removed;
+          if (current_line == app->bcl) removed_active = removed;
+          if (removed > 0) changed = true;
+        }
+        if (changed)
+        {
+          app->bac -= min_u64(app->bac, removed_anchor);
+          app->bcc -= min_u64(app->bcc, removed_active);
+          app->bdc -= min_u64(app->bdc, removed_active);
+        }
+      }
+      if (changed)
+      {
+        update_title(app);
+        set_caret_line_col(app, app->bcl, app->bcc);
+      }
+      end_edit_txn(app);
+      app->suppress_tab_char_once = true;
+      keep_visible_and_repaint(app);
+      return;
+    }
+    if (!shift)
+    {
+      if (apply_basic_edit(app, "  ", 2, false, false))
+      {
+        app->suppress_tab_char_once = true;
+        keep_visible_and_repaint(app);
+      }
+      return;
+    }
+    else
+    {
+      u64 caret = app->co;
+      u64 removed = 0;
+      begin_edit_txn(app);
+      removed = app_remove_spaces_near_caret(app, &caret);
+      if (removed == 0)
+      {
+        u64 removed_indent = app_remove_line_indent(app, app->cl);
+        if (removed_indent > 0)
+        {
+          u64 line_start = doc_line_start(&app->doc, app->cl);
+          u64 col = caret >= line_start ? caret - line_start : 0;
+          caret -= min_u64(col, removed_indent);
+          removed = removed_indent;
+        }
+      }
+      if (removed > 0)
+      {
+        app->co = caret;
+        clear_stream_selection(app);
+        sync_caret_from_offsets(app);
+        update_title(app);
+        keep_visible_and_repaint(app);
+      }
+      end_edit_txn(app);
+      app->suppress_tab_char_once = true;
+      return;
+    }
+  }
+  if (vk == VK_TAB && has_stream_selection(app))
+  {
+    u64 sel_start = min_u64(app->sa, app->sv);
+    u64 sel_end = max_u64(app->sa, app->sv);
+    u64 start_line = 0;
+    u64 end_line = 0;
+    u64 ignored_col = 0;
+    doc_offset_to_line_col(&app->doc, sel_start, &start_line, &ignored_col);
+    doc_offset_to_line_col(&app->doc, sel_end, &end_line, &ignored_col);
+    u64 end_line_start = doc_line_start(&app->doc, end_line);
+    bool include_end_line = (sel_end > end_line_start) || (sel_start == sel_end);
+    u64 line_count = include_end_line ? (end_line - start_line + 1) : (end_line - start_line);
+    u64 line;
+    u64 delta_total = 0;
+    bool changed = false;
+
+    if (line_count == 0) return;
+
+    begin_edit_txn(app);
+    if (!shift)
+    {
+      for (line = 0; line < line_count; ++line)
+      {
+        u64 line_off = doc_line_start(&app->doc, start_line + line);
+        if (app_doc_insert(app, line_off, "  ", 2))
+        {
+          delta_total += 2;
+          changed = true;
+        }
+      }
+      if (changed)
+      {
+        app->sa = sel_start + 2;
+        app->sv = sel_end + delta_total;
+      }
+    }
+    else
+    {
+      u64 removed_first_line = 0;
+      for (line = 0; line < line_count; ++line)
+      {
+        char prefix[2] = {0, 0};
+        CopyCtx ctx = {prefix, 0};
+        u64 line_off = doc_line_start(&app->doc, start_line + line);
+        u64 remove = 0;
+        doc_read_range(&app->doc, line_off, min_u64(2, app->doc.len - line_off), copy_span, &ctx);
+        if (prefix[0] == ' ') remove++;
+        if (prefix[0] == ' ' && prefix[1] == ' ') remove++;
+        if (remove > 0)
+        {
+          app_doc_delete(app, line_off, remove);
+          if (line == 0) removed_first_line = remove;
+          delta_total += remove;
+          changed = true;
+        }
+      }
+      if (changed)
+      {
+        u64 original_line_start = doc_line_start(&app->doc, start_line);
+        u64 start_col = sel_start - original_line_start;
+        u64 removed_at_start = min_u64(removed_first_line, start_col);
+        app->sa = sel_start - removed_at_start;
+        app->sv = sel_end - delta_total;
+      }
+    }
+    if (changed)
+    {
+      app->co = app->sv;
+      sync_caret_from_offsets(app);
+      update_title(app);
+    }
+    app->suppress_tab_char_once = true;
+    end_edit_txn(app);
+    keep_visible_and_repaint(app);
+    return;
+  }
+  switch (vk)
+  {
+  case VK_LEFT:
+    if (ctrl) move_caret_word_left(app); else move_caret_left(app);
+    moved = true;
+    break;
+  case VK_RIGHT:
+    if (ctrl) move_caret_word_right(app); else move_caret_right(app);
+    moved = true;
+    break;
+  case VK_UP:
+    if (ctrl)
+    {
+      u64 old_tl = app->tl;
+      app->vsb = false;
+      if (app->tl > 0) app->tl--;
+      update_scrollbars(app);
+      if (app->tl != old_tl)
+      {
+        preserve_caret_row_for_scroll(app, old_tl);
+        moved = true;
+      }
+    }
+    else
+    {
+      if (app->cl > 0)
+        set_caret_line_col(app, app->cl - 1, app->cc);
+      else
+        set_caret_line_col(app, 0, 0);
+      moved = true;
+    }
+    break;
+  case VK_DOWN:
+    if (ctrl)
+    {
+      u64 old_tl = app->tl;
+      app->vsb = false;
+      app->tl++;
+      update_scrollbars(app);
+      if (app->tl != old_tl)
+      {
+        preserve_caret_row_for_scroll(app, old_tl);
+        moved = true;
+      }
+    }
+    else
+    {
+      doc_discover_for_view(&app->doc, app->cl, 2);
+      if (app->cl + 1 < app->doc.lines.count)
+        set_caret_line_col(app, app->cl + 1, app->cc);
+      else
+      {
+        u64 start = doc_line_start(&app->doc, app->cl);
+        u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
+        app->cc = end - start;
+        app->co = end;
+      }
+      moved = true;
+    }
+    break;
+  case VK_PRIOR:
+    set_caret_line_col(app, app->cl > (u64)app->rows ? app->cl - (u64)app->rows : 0, app->cc);
+    moved = true;
+    break;
+  case VK_NEXT:
+    set_caret_line_col(app, app->cl + (u64)app->rows, app->cc);
+    doc_discover_for_view(&app->doc, app->cl, (u64)app->rows);
+    moved = true;
+    break;
+  case VK_HOME:
+    if (ctrl)
+    {
+      set_caret_line_col(app, 0, 0);
+    }
+    else
+    {
+      u64 first_nonblank = doc_line_first_nonblank_col(&app->doc, app->cl);
+      u64 target_col = (app->cc == 0) ? first_nonblank : 0;
+      set_caret_line_col(app, app->cl, target_col);
+    }
+    moved = true;
+    break;
+  case VK_END:
+  {
+    u64 line = app->cl;
+    if (ctrl)
+    {
+      doc_discover_all_lines(&app->doc);
+      line = app->doc.lines.count ? app->doc.lines.count - 1 : 0;
+      app->cl = line;
+    }
+    u64 start = doc_line_start(&app->doc, line);
+    u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
+    app->cc = end - start;
+    app->co = end;
+    moved = true;
+  } break;
+  case VK_BACK:
+  {
+    if (has_box_selection(app))
+    {
+      apply_basic_edit(app, NULL, 0, true, false);
+      break;
+    }
+    if (has_stream_selection(app))
+    {
+      begin_edit_txn(app);
+      if (delete_selection(app))
+      {
+        update_title(app);
+        break;
+      }
+    }
+    if (ctrl && app->co > 0)
+    {
+      begin_edit_txn(app);
+      u64 old_off = app->co;
+      move_caret_word_left(app);
+      if (app->co < old_off)
+      {
+        app_doc_delete(app, app->co, old_off - app->co);
+        update_title(app);
+      }
+      break;
+    }
+    if (app->co > 0)
+    {
+      begin_edit_txn(app);
+      u64 off = app->co;
+      u64 del_start = off - 1;
+      u64 del = 1;
+      if (app->cc == 0 && app->cl > 0)
+      {
+        u64 prev_start = doc_line_start(&app->doc, app->cl - 1);
+        u64 prev_end = doc_line_length_clamped(&app->doc, prev_start, UINT32_MAX);
+        del_start = prev_end;
+        del = off - prev_end;
+        app->cl--;
+        app->cc = prev_end - prev_start;
+        app->co = del_start;
+      }
+      else
+      {
+        app->cc--;
+        app->co--;
+      }
+      app_doc_delete(app, del_start, del);
+      update_title(app);
+    }
+  } break;
+  case VK_DELETE:
+  {
+    if (has_box_selection(app))
+    {
+      apply_basic_edit(app, NULL, 0, false, true);
+      break;
+    }
+    if (has_stream_selection(app))
+    {
+      begin_edit_txn(app);
+      if (delete_selection(app))
+      {
+        update_title(app);
+        break;
+      }
+    }
+    if (ctrl && app->co < app->doc.len)
+    {
+      begin_edit_txn(app);
+      u64 old_off = app->co;
+      move_caret_word_right(app);
+      if (app->co > old_off)
+      {
+        u64 del_len = app->co - old_off;
+        app->co = old_off;
+        sync_caret_from_offsets(app);
+        app_doc_delete(app, old_off, del_len);
+        update_title(app);
+      }
+      break;
+    }
+    u64 off = app->co;
+    if (off < app->doc.len)
+    {
+      begin_edit_txn(app);
+      u64 del = 1;
+      char c[2] = {0, 0};
+      CopyCtx ctx = { c, 0 };
+      doc_read_range(&app->doc, off, min_u64(2, app->doc.len - off), copy_span, &ctx);
+      if (c[0] == '\r' && c[1] == '\n') del = 2;
+      app_doc_delete(app, off, del);
+      update_title(app);
+    }
+  } break;
+  default:
+    break;
+  }
+  if (moved)
+  {
+    if (has_box_selection(app) && !alt) clear_box_selection(app);
+    if (shift)
+    {
+      if (!has_stream_selection(app)) app->sa = old_off;
+      app->sv = app->co;
+    }
+    else
+      clear_stream_selection(app);
+  }
+  end_edit_txn(app);
+  keep_visible_and_repaint(app);
+}
+
+static void handle_char(App *app, WPARAM ch)
+{
+  app->vsb = false;
+  if (ch == L'\t' && app->suppress_tab_char_once)
+  {
+    app->suppress_tab_char_once = false;
+    return;
+  }
+  if (ch != L'\t') app->suppress_tab_char_once = false;
+  char bytes[8];
+  int n = 0;
+  if (ch == L'\r')
+  {
+    bytes[0] = '\n';
+    n = 1;
+  }
+  else if (ch == L'\t')
+  {
+    bytes[0] = ' ';
+    bytes[1] = ' ';
+    n = 2;
+  }
+  else if (ch >= 32 && ch != 127)
+  {
+    WCHAR w[2] = {(WCHAR)ch, 0};
+    n = WideCharToMultiByte(CP_UTF8, 0, w, 1, bytes, (int)sizeof(bytes), NULL, NULL);
+  }
+  if (n > 0)
+  {
+    if (has_box_selection(app))
+    {
+      if (apply_basic_edit(app, bytes, (u64)n, false, false))
+        keep_visible_and_repaint(app);
+      return;
+    }
+    begin_edit_txn(app);
+    if (has_stream_selection(app)) delete_selection(app);
+    u64 off = app->co;
+    if (app_doc_insert(app, off, bytes, (u64)n))
+    {
+      app->co += (u64)n;
+      if (bytes[0] == '\n')
+      {
+        app->cl++;
+        app->cc = 0;
+      }
+      else
+        app->cc += (u64)n;
+      update_title(app);
+      clear_stream_selection(app);
+      keep_visible_and_repaint(app);
+    }
+    end_edit_txn(app);
+  }
+}
+
+static int doc_copy_utf8_z(Document *doc, char **out_utf8)
+{
+  *out_utf8 = NULL;
+  size_t n = (size_t)doc->len;
+  char *buf = (char *)malloc(n + 1);
+  if (!buf) return 0;
+  CopyCtx ctx = { buf, 0 };
+  doc_read_range(doc, 0, doc->len, copy_span, &ctx);
+  buf[n] = 0;
+  *out_utf8 = buf;
+  return (int)n;
+}
+
+static bool sync_path_utf8_on_change(App *app)
+{
+  if (!app->doc.dirty) return false;
+  if (app->doc.path[0]) return true;
+  return app->doc.len != 0;
+}
+
+static void repro_capture_ui_state(const App *app, ReproUiState *state)
+{
+  if (!app || !state) return;
+  state->co = app->co;
+  state->sa = app->sa;
+  state->sv = app->sv;
+  state->tl = app->tl;
+  state->fc = app->fc;
+  state->doc_len = app->doc.len;
+  state->cl = app->cl;
+  state->cc = app->cc;
+  state->bal = app->bal;
+  state->bac = app->bac;
+  state->bcl = app->bcl;
+  state->bcc = app->bcc;
+  state->bdc = app->bdc;
+  state->rows = app->rows;
+  state->cols = app->cols;
+  state->box_sel = has_box_selection(app);
+  state->stream_sel = has_stream_selection(app);
+}
+
+static void repro_begin_app_event(const App *app, const char *kind, unsigned long a, unsigned long b)
+{
+  ReproUiState before;
+  repro_capture_ui_state(app, &before);
+  repro_begin_input_event(kind, a, b, &before);
+}
+
+static void repro_end_app_event(const App *app)
+{
+  ReproUiState after;
+  repro_capture_ui_state(app, &after);
+  repro_end_input_event(&after);
+}
+
+static u64 repro_collect_deleted_preview(const SpanRef *spans, size_t span_count, char *buf, u64 cap)
+{
+  size_t i;
+  u64 total = 0;
+  if (!buf || cap == 0) return 0;
+  for (i = 0; i < span_count && total < cap; ++i)
+  {
+    u64 take = min_u64(spans[i].len, cap - total);
+    memcpy(buf + total, spans[i].data, (size_t)take);
+    total += take;
+  }
+  return total;
+}
+
+
 
 /******************************************************************************
  * Commands
@@ -2085,13 +3760,13 @@ static bool run_codex_do_command(App *app)
     }
     if (_wsplitpath_s(app->doc.path, drive, _countof(drive), dir, _countof(dir), fname, _countof(fname), ext, _countof(ext)) != 0)
       return false;
-    swprintf(cwd, _countof(cwd), L"%ls%ls", drive, dir);
-    swprintf(file_name, _countof(file_name), L"%ls%ls", fname, ext);
+    wfmt(cwd, _countof(cwd), L"%ls%ls", drive, dir);
+    wfmt(file_name, _countof(file_name), L"%ls%ls", fname, ext);
   }
   else
   {
     if (!_wgetcwd(cwd, _countof(cwd))) return false;
-    wcscpy_s(file_name, _countof(file_name), L"tasks.txt");
+    wcs_copy_trunc(file_name, _countof(file_name), L"tasks.txt");
   }
   /* Avoid trailing slash before a closing quote in CreateProcess command line.
   A terminal backslash can escape the quote during argv parsing. */
@@ -2103,7 +3778,7 @@ static bool run_codex_do_command(App *app)
       cwd[--cwd_len] = 0;
     }
   }
-  swprintf(command, _countof(command),
+  wfmt(command, _countof(command),
            L"codex --cd \"%ls\" \"Please execute the instructions inside %ls.\"",
            cwd, file_name);
   ZeroMemory(&si, sizeof(si));
@@ -2162,182 +3837,7 @@ static void apply_font_size(App *app, int new_size)
   }
 }
 
-/******************************************************************************
- * Rendering
- ******************************************************************************/
-typedef struct VisibleCtx
-{
-  u64 skip;
-  WCHAR *out;
-  int n;
-  int max;
-} VisibleCtx;
 
-static void visible_span(const char *data, u64 len, void *user)
-{
-  VisibleCtx *ctx = (VisibleCtx *)user;
-  if (ctx->skip >= len)
-  {
-    ctx->skip -= len;
-    return;
-  }
-  data += ctx->skip;
-  len -= ctx->skip;
-  ctx->skip = 0;
-  for (u64 i = 0; i < len && ctx->n < ctx->max; ++i)
-  {
-    unsigned char c = (unsigned char)data[i];
-    if (c == '\r' || c == '\n') break;
-    if (c == '\t')
-    {
-      int spaces = TAB_WIDTH - (ctx->n % TAB_WIDTH);
-      while (spaces-- > 0 && ctx->n < ctx->max) ctx->out[ctx->n++] = L' ';
-    }
-    else if (c < 32)
-      ctx->out[ctx->n++] = L' ';
-    else
-      ctx->out[ctx->n++] = (WCHAR)c;
-  }
-}
-
-static int line_to_wide_visible(Document *doc, u64 start, u64 end, u64 fc, int max_cols, WCHAR *out)
-{
-  if (start >= end) return 0;
-  VisibleCtx ctx = { fc, out, 0, max_cols };
-  doc_read_range(doc, start, end - start, visible_span, &ctx);
-  return ctx.n;
-}
-
-static void paint_editor(App *app, HDC dc)
-{
-  RECT rc;
-  GetClientRect(app->hwnd, &rc);
-  FillRect(dc, &rc, app->bg_brush);
-  RECT gutter = rc;
-  gutter.right = app->gutter_w;
-  HBRUSH gutter_bg = CreateSolidBrush(THEME_GUTTER_BG);
-  FillRect(dc, &gutter, gutter_bg);
-  DeleteObject(gutter_bg);
-  SelectObject(dc, app->font);
-  SetBkMode(dc, TRANSPARENT);
-  int max_cols = app->cols + 2;
-  if (max_cols > MAX_PAINT_COLS - 1) max_cols = MAX_PAINT_COLS - 1;
-  WCHAR text_buf[MAX_PAINT_COLS];
-  WCHAR num_buf[32];
-  int text_left = app->gutter_w + EDIT_TEXT_LEFT_PADDING;
-  HBRUSH active_line_brush = CreateSolidBrush(THEME_GUTTER_ACTIVE_LINE_BG);
-  HBRUSH selection_brush = CreateSolidBrush(THEME_SELECTION_BG);
-  doc_discover_for_view(&app->doc, app->tl, (u64)app->rows);
-  for (int row = 0; row < app->rows; ++row)
-  {
-    u64 line = app->tl + (u64)row;
-    int y = row * app->line_h;
-    if (line < app->doc.lines.count)
-    {
-      if (line == app->cl && active_line_brush)
-      {
-        RECT line_rc;
-        line_rc.left = 0;
-        line_rc.top = y;
-        line_rc.right = app->gutter_w - EDIT_LINE_NUMBER_RIGHT_PADDING;
-        line_rc.bottom = y + app->line_h;
-        FillRect(dc, &line_rc, active_line_brush);
-      }
-      SetTextColor(dc, THEME_GUTTER_FG);
-      int gutter_chars = digit_count_u64(doc_known_line_count(&app->doc));
-      if (gutter_chars < 1) gutter_chars = 1;
-      swprintf(num_buf, _countof(num_buf), L"%*llu", gutter_chars, (unsigned long long)(line + 1));
-      TextOutW(dc, EDIT_LINE_NUMBER_LEFT_PADDING, y, num_buf, lstrlenW(num_buf));
-      u64 start = app->doc.lines.starts[line];
-      u64 end = app->doc.len;
-      if (line + 1 < app->doc.lines.count)
-      {
-        end = app->doc.lines.starts[line + 1];
-        while (end > start)
-        {
-          char c = 0;
-          CopyCtx ctx = { &c, 0 };
-          doc_read_range(&app->doc, end - 1, 1, copy_span, &ctx);
-          if (c != '\n' && c != '\r') break;
-          --end;
-        }
-      }
-      int n = line_to_wide_visible(&app->doc, start, end, app->fc, max_cols, text_buf);
-      SetTextColor(dc, THEME_TEXT);
-      if (n > 0) TextOutW(dc, text_left, y, text_buf, n);
-      if (has_stream_selection(app))
-      {
-        u64 sel_start = min_u64(app->sa, app->sv);
-        u64 sel_end = max_u64(app->sa, app->sv);
-        u64 draw_start = max_u64(sel_start, start);
-        u64 draw_end = min_u64(sel_end, end);
-        if (draw_end > draw_start)
-        {
-          u64 col_start = draw_start - start;
-          u64 col_end = draw_end - start;
-          if (col_end > app->fc)
-          {
-            int vis_start = (int)(col_start > app->fc ? col_start - app->fc : 0);
-            int vis_end = (int)(col_end - app->fc);
-            if (vis_start < 0) vis_start = 0;
-            if (vis_end > n) vis_end = n;
-            if (vis_end > vis_start)
-            {
-              RECT sel_rc;
-              sel_rc.left = text_left + vis_start * app->char_w;
-              sel_rc.right = text_left + vis_end * app->char_w;
-              sel_rc.top = y;
-              sel_rc.bottom = y + app->line_h;
-              FillRect(dc, &sel_rc, selection_brush);
-              SetTextColor(dc, THEME_SELECTION_TEXT);
-              TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, vis_end - vis_start);
-              SetTextColor(dc, THEME_TEXT);
-            }
-          }
-        }
-      }
-      if (has_box_selection(app))
-      {
-        u64 top, bottom, left, right;
-        box_selection_bounds(app, &top, &bottom, &left, &right);
-        if (line >= top && line <= bottom && right > left)
-        {
-          int vis_start = 0;
-          int vis_end = 0;
-          if (right > app->fc)
-          {
-            vis_start = (int)(left > app->fc ? left - app->fc : 0);
-            vis_end = (int)(right - app->fc);
-            if (vis_start < 0) vis_start = 0;
-            if (vis_end > max_cols) vis_end = max_cols;
-            if (vis_end > vis_start)
-            {
-              RECT sel_rc;
-              sel_rc.left = text_left + vis_start * app->char_w;
-              sel_rc.right = text_left + vis_end * app->char_w;
-              sel_rc.top = y;
-              sel_rc.bottom = y + app->line_h;
-              FillRect(dc, &sel_rc, selection_brush);
-              if (vis_start < n)
-              {
-                int text_vis_end = vis_end;
-                if (text_vis_end > n) text_vis_end = n;
-                if (text_vis_end > vis_start)
-                {
-                  SetTextColor(dc, THEME_SELECTION_TEXT);
-                  TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, text_vis_end - vis_start);
-                  SetTextColor(dc, THEME_TEXT);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  if (active_line_brush) DeleteObject(active_line_brush);
-  if (selection_brush) DeleteObject(selection_brush);
-}
 
 /******************************************************************************
  * File / Find Dialogs
@@ -2366,244 +3866,224 @@ static void open_dialog(App *app)
 
 static bool find_next(App *app, const WCHAR *query)
 {
-  int qbytes = WideCharToMultiByte(CP_UTF8, 0, query, -1, NULL, 0, NULL, NULL);
-  if (qbytes <= 1 || app->doc.len == 0) return false;
-  char *q = (char *)malloc((size_t)qbytes);
-  char *hay = (char *)malloc((size_t)app->doc.len);
-  if (!q || !hay)
+  int i;
+  if (!query || !query[0]) return false;
+  if (wcscmp(app->fq, query) != 0)
+    wcs_copy_n_trunc(app->fq, _countof(app->fq), query, (size_t)-1);
+  if (app->find_hwnd && IsWindow(app->find_hwnd))
   {
-    free(q);
-    free(hay);
+    find_popup_update_matches(app);
+    for (i = 0; i < app->find_result_count; ++i)
+    {
+      if (app->find_results[i].off >= app->co)
+      {
+        find_popup_select_result(app, i);
+        return true;
+      }
+    }
+    if (app->find_result_count > 0)
+    {
+      find_popup_select_result(app, 0);
+      return true;
+    }
     return false;
   }
-  WideCharToMultiByte(CP_UTF8, 0, query, -1, q, qbytes, NULL, NULL);
-  SearchCtx sctx = { hay, 0 };
-  doc_read_range(&app->doc, 0, app->doc.len, append_span, &sctx);
-  u64 qlen = (u64)qbytes - 1;
-  u64 start = app->co < app->doc.len ? app->co : 0;
-  const char *match = NULL;
-  if (start < app->doc.len)
-  {
-    for (u64 i = start; i + qlen <= app->doc.len; ++i)
-    {
-      if (memcmp(hay + i, q, (size_t)qlen) == 0)
-      {
-        match = hay + i;
-        break;
-      }
-    }
-  }
-  if (!match && start > 0)
-  {
-    for (u64 i = 0; i < start && i + qlen <= app->doc.len; ++i)
-    {
-      if (memcmp(hay + i, q, (size_t)qlen) == 0)
-      {
-        match = hay + i;
-        break;
-      }
-    }
-  }
-  if (match)
-  {
-    u64 off = (u64)(match - hay);
-    u64 end_off = min_u64(off + qlen, app->doc.len);
-    app->sa = off;
-    app->sv = end_off;
-    app->co = end_off;
-    doc_offset_to_line_col(&app->doc, app->co, &app->cl, &app->cc);
-    keep_visible_and_repaint(app);
-  }
-  free(q);
-  free(hay);
-  return match != NULL;
+  return false;
 }
 
-static u64 count_query_matches(App *app, const WCHAR *query)
-{
-  int qbytes = WideCharToMultiByte(CP_UTF8, 0, query, -1, NULL, 0, NULL, NULL);
-  if (qbytes <= 1 || app->doc.len == 0) return 0;
-  char *q = (char *)malloc((size_t)qbytes);
-  char *hay = (char *)malloc((size_t)app->doc.len);
-  u64 count = 0;
-  if (!q || !hay)
-  {
-    free(q);
-    free(hay);
-    return 0;
-  }
-  WideCharToMultiByte(CP_UTF8, 0, query, -1, q, qbytes, NULL, NULL);
-  SearchCtx sctx = { hay, 0 };
-  doc_read_range(&app->doc, 0, app->doc.len, append_span, &sctx);
-  {
-    u64 qlen = (u64)qbytes - 1;
-    u64 i = 0;
-    while (i + qlen <= app->doc.len)
-    {
-      if (memcmp(hay + i, q, (size_t)qlen) == 0)
-      {
-        count++;
-        i += qlen;
-      }
-      else
-        i++;
-    }
-  }
-  free(q);
-  free(hay);
-  return count;
-}
-
-static void trigger_find_from_dialog(HWND dlg)
+static LRESULT CALLBACK find_popup_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
   App *app = &g_app;
-  HWND edit = GetDlgItem(dlg, edt1);
-  GetDlgItemTextW(dlg, edt1, app->fq, (int)_countof(app->fq));
-  update_find_count_label(dlg);
-  find_next(app, app->fq);
-  if (edit) SetFocus(edit);
-}
-
-static LRESULT CALLBACK find_edit_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-  HWND dlg = GetParent(hwnd);
-  if (msg == WM_KEYDOWN)
+  switch (msg)
   {
-    if (wp == VK_RETURN)
+  case WM_ERASEBKGND:
+  {
+    RECT rc;
+    HDC dc = (HDC)wp;
+    if (dc && GetClientRect(hwnd, &rc))
     {
-      trigger_find_from_dialog(dlg);
-      return 0;
+      FillRect(dc, &rc, app->cmd_bg_brush ? app->cmd_bg_brush : app->bg_brush);
+      return 1;
     }
-    if (wp == VK_ESCAPE)
+    break;
+  }
+  case WM_CREATE:
+  {
+    app->find_edit = CreateWindowExW(0, L"EDIT", L"",
+                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                     8, 8, 344, 28, hwnd, (HMENU)(INT_PTR)IDC_FIND_EDIT, GetModuleHandleW(NULL), NULL);
+    app->find_list = CreateWindowExW(0, L"LISTBOX", L"",
+                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
+                                     8, 42, 344, 124, hwnd, (HMENU)(INT_PTR)IDC_FIND_LIST, GetModuleHandleW(NULL), NULL);
+    app->find_count_label = CreateWindowExW(0, L"STATIC", L"0 entities found",
+                                            WS_CHILD | WS_VISIBLE,
+                                            8, 170, 344, 18, hwnd, (HMENU)(INT_PTR)IDC_FIND_COUNT, GetModuleHandleW(NULL), NULL);
+    if (app->font)
     {
-      DestroyWindow(dlg);
-      return 0;
+      SendMessageW(app->find_edit, WM_SETFONT, (WPARAM)app->font, TRUE);
+      SendMessageW(app->find_list, WM_SETFONT, (WPARAM)app->font, TRUE);
+      SendMessageW(app->find_count_label, WM_SETFONT, (WPARAM)app->font, TRUE);
     }
-  }
-  if (msg == WM_CHAR)
-  {
-    if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
-  }
-  if (g_find_edit_wndproc) return CallWindowProcW(g_find_edit_wndproc, hwnd, msg, wp, lp);
-  return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-static LRESULT CALLBACK find_button_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-  HWND dlg = GetParent(hwnd);
-  if (msg == WM_KEYDOWN && wp == VK_RETURN)
-  {
-    trigger_find_from_dialog(dlg);
+    g_find_popup_edit_wndproc = (WNDPROC)SetWindowLongPtrW(app->find_edit, GWLP_WNDPROC, (LONG_PTR)find_popup_edit_wndproc);
+    SetWindowTextW(app->find_edit, app->fq);
+    SetFocus(app->find_edit);
+    find_popup_update_matches(app);
     return 0;
   }
-  if (msg == WM_CHAR && wp == VK_RETURN) return 0;
-  if (g_find_button_wndproc) return CallWindowProcW(g_find_button_wndproc, hwnd, msg, wp, lp);
-  return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-static void update_find_count_label(HWND hwnd)
-{
-  App *app = &g_app;
-  HWND label = GetDlgItem(hwnd, IDC_FIND_COUNT);
-  WCHAR query[256];
-  WCHAR text[96];
-  u64 count;
-  if (!label) return;
-  GetDlgItemTextW(hwnd, edt1, query, (int)_countof(query));
-  count = count_query_matches(app, query);
-  swprintf(text, _countof(text), L"%llu entities found", (unsigned long long)count);
-  SetWindowTextW(label, text);
-}
-
-static UINT_PTR CALLBACK find_dialog_hook(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-  (void)lp;
-  if (msg == WM_INITDIALOG)
+  case WM_SIZE:
   {
-    HWND edit;
-    HWND button;
-    HWND label;
-    HFONT font;
-    RECT rc_edit;
-    RECT rc_button;
-    POINT p;
-    SetWindowTextW(hwnd, L"find");
-    SetDlgItemTextW(hwnd, IDOK, L"Find");
-    ShowWindow(GetDlgItem(hwnd, IDCANCEL), SW_HIDE);
-    ShowWindow(GetDlgItem(hwnd, stc2), SW_HIDE);
-    edit = GetDlgItem(hwnd, edt1);
-    button = GetDlgItem(hwnd, IDOK);
-    if (edit && button && GetWindowRect(edit, &rc_edit) && GetWindowRect(button, &rc_button))
-    {
-      p.x = rc_edit.left;
-      p.y = rc_edit.bottom + 8;
-      ScreenToClient(hwnd, &p);
-      label = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                              p.x, p.y, rc_button.right - rc_edit.left, 18,
-                              hwnd, (HMENU)(INT_PTR)IDC_FIND_COUNT, GetModuleHandleW(NULL), NULL);
-      if (label)
-      {
-        font = (HFONT)SendMessageW(edit, WM_GETFONT, 0, 0);
-        if (font) SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
-      }
-      g_find_edit_wndproc = (WNDPROC)SetWindowLongPtrW(edit, GWLP_WNDPROC, (LONG_PTR)find_edit_wndproc);
-      g_find_button_wndproc = (WNDPROC)SetWindowLongPtrW(button, GWLP_WNDPROC, (LONG_PTR)find_button_wndproc);
-    }
-    SetWindowTextW(GetDlgItem(hwnd, IDC_FIND_COUNT), L"0 entities found");
-    return 1;
+    int w = LOWORD(lp);
+    int h = HIWORD(lp);
+    if (app->find_edit) MoveWindow(app->find_edit, 8, 8, w - 16, 28, TRUE);
+    if (app->find_list) MoveWindow(app->find_list, 8, 42, w - 16, h - 72, TRUE);
+    if (app->find_count_label) MoveWindow(app->find_count_label, 8, h - 24, w - 16, 18, TRUE);
+    return 0;
   }
-  if (msg == WM_COMMAND)
+  case WM_PAINT:
   {
-    WORD id = LOWORD(wp);
-    if (id == IDCANCEL)
+    PAINTSTRUCT ps;
+    RECT rc;
+    BeginPaint(hwnd, &ps);
+    if (GetClientRect(hwnd, &rc))
+      FillRect(ps.hdc, &rc, app->cmd_bg_brush ? app->cmd_bg_brush : app->bg_brush);
+    EndPaint(hwnd, &ps);
+    return 0;
+  }
+  case WM_ACTIVATE:
+    if (LOWORD(wp) == WA_INACTIVE)
     {
       DestroyWindow(hwnd);
-      return 1;
+      return 0;
     }
-  }
-  if (msg == WM_KEYDOWN)
-  {
-    if (wp == VK_RETURN)
+    break;
+  case WM_COMMAND:
+    if (LOWORD(wp) == IDC_FIND_EDIT && HIWORD(wp) == EN_CHANGE)
     {
-      HWND find_button = GetDlgItem(hwnd, IDOK);
-      if (find_button) SendMessageW(find_button, BM_CLICK, 0, 0);
-      return 1;
+      GetWindowTextW(app->find_edit, app->fq, (int)_countof(app->fq));
+      find_popup_update_matches(app);
+      return 0;
     }
-    if (wp == VK_ESCAPE)
+    if (LOWORD(wp) == IDC_FIND_LIST && HIWORD(wp) == LBN_DBLCLK)
     {
-      DestroyWindow(hwnd);
-      return 1;
+      find_popup_activate_selected(app);
+      SetFocus(app->find_edit);
+      return 0;
     }
-  }
-  if (msg == WM_CHAR)
+    break;
+  case WM_MEASUREITEM:
   {
-    if (wp == VK_RETURN || wp == VK_ESCAPE) return 1;
+    MEASUREITEMSTRUCT *mis = (MEASUREITEMSTRUCT *)lp;
+    if (mis && mis->CtlID == IDC_FIND_LIST)
+    {
+      mis->itemHeight = (UINT)(app->line_h + 10);
+      return TRUE;
+    }
+    break;
   }
-  if (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORSTATIC)
+  case WM_DRAWITEM:
+  {
+    DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
+    if (dis && dis->CtlID == IDC_FIND_LIST)
+    {
+      HBRUSH bg_brush;
+      COLORREF text_color;
+      RECT rc = dis->rcItem;
+      WCHAR line_text[32];
+      FindResult *result;
+      if ((int)dis->itemID < 0 || (int)dis->itemID >= app->find_result_count) return TRUE;
+      result = &app->find_results[dis->itemID];
+      bg_brush = CreateSolidBrush((dis->itemState & ODS_SELECTED) ? THEME_GUTTER_ACTIVE_LINE_BG : THEME_CMD_POPUP_BG);
+      FillRect(dis->hDC, &rc, bg_brush);
+      DeleteObject(bg_brush);
+      SetBkMode(dis->hDC, TRANSPARENT);
+      text_color = (dis->itemState & ODS_SELECTED) ? THEME_SELECTION_TEXT : THEME_TEXT;
+      SetTextColor(dis->hDC, text_color);
+      rc.left += 8;
+      rc.top += 4;
+      DrawTextW(dis->hDC, result->preview, -1, &rc, DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+      wfmt(line_text, _countof(line_text), L"(line %llu)", (unsigned long long)(result->line + 1));
+      rc = dis->rcItem;
+      rc.right -= 8;
+      rc.top += 4;
+      SetTextColor(dis->hDC, RGB(190, 178, 160));
+      DrawTextW(dis->hDC, line_text, -1, &rc, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+      if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &dis->rcItem);
+      return TRUE;
+    }
+    break;
+  }
+  case WM_CTLCOLORLISTBOX:
+  case WM_CTLCOLOREDIT:
+  case WM_CTLCOLORSTATIC:
   {
     HDC dc = (HDC)wp;
     SetTextColor(dc, THEME_TEXT);
-    SetBkColor(dc, THEME_BG);
-    return (UINT_PTR)g_find_bg_brush;
+    SetBkColor(dc, THEME_CMD_POPUP_BG);
+    return (LRESULT)(app->cmd_bg_brush ? app->cmd_bg_brush : app->bg_brush);
   }
-  return 0;
+  case WM_CLOSE:
+    DestroyWindow(hwnd);
+    return 0;
+  case WM_DESTROY:
+    if (app->find_hwnd == hwnd)
+    {
+      HWND owner = GetWindow(hwnd, GW_OWNER);
+      if (!owner) owner = app->hwnd;
+      app->find_hwnd = NULL;
+      app->find_edit = NULL;
+      app->find_list = NULL;
+      app->find_count_label = NULL;
+      g_find_popup_edit_wndproc = NULL;
+      if (owner && IsWindow(owner))
+        PostMessageW(owner, WM_APP_RESTORE_EDITOR_FOCUS, 0, 0);
+    }
+    return 0;
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void open_find_dialog(App *app)
+static void close_find_popup(App *app)
 {
+  if (app->find_hwnd && IsWindow(app->find_hwnd))
+    DestroyWindow(app->find_hwnd);
+}
+
+static void open_find_popup(App *app)
+{
+  RECT rc = { 0 };
+  POINT p = { 0 };
+  int x = 40;
+  int y = 40;
+  int w = 360;
+  int h = 220;
   if (app->find_hwnd && IsWindow(app->find_hwnd))
   {
     SetForegroundWindow(app->find_hwnd);
+    SetFocus(app->find_edit);
     return;
   }
-  memset(&app->fs, 0, sizeof(app->fs));
-  app->fs.lStructSize = sizeof(app->fs);
-  app->fs.hwndOwner = app->hwnd;
-  app->fs.lpstrFindWhat = app->fq;
-  app->fs.wFindWhatLen = (WORD)_countof(app->fq);
-  app->fs.Flags = FR_DOWN | FR_HIDEUPDOWN | FR_HIDEWHOLEWORD | FR_HIDEMATCHCASE | FR_ENABLEHOOK;
-  app->fs.lpfnHook = find_dialog_hook;
-  app->find_hwnd = FindTextW(&app->fs);
+  if (GetCaretPos(&p))
+  {
+    ClientToScreen(app->hwnd, &p);
+    x = p.x - 9;
+    y = p.y - 8;
+  }
+  else if (GetClientRect(app->hwnd, &rc))
+  {
+    p.x = app->gutter_w + EDIT_TEXT_LEFT_PADDING + (int)((app->cc - app->fc) * (u64)app->char_w);
+    p.y = (int)((app->cl - app->tl) * (u64)app->line_h);
+    if (p.x < 0) p.x = 0;
+    if (p.y < 0) p.y = 0;
+    ClientToScreen(app->hwnd, &p);
+    x = p.x;
+    y = p.y;
+  }
+  app->find_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, FIND_POPUP_CLASS_NAME, L"find",
+                                   WS_POPUP,
+                                   x, y, w, h, app->hwnd, NULL, GetModuleHandleW(NULL), NULL);
+  if (!app->find_hwnd) return;
+  ShowWindow(app->find_hwnd, SW_SHOW);
+  UpdateWindow(app->find_hwnd);
 }
 
 static void copy_selection_or_current_line_to_clipboard(App *app)
@@ -3150,7 +4630,11 @@ static void save_as_dialog(App *app)
 static void paste_clipboard(App *app)
 {
   app->vsb = false;
-  if (!OpenClipboard(app->hwnd)) return;
+  for (int attempt = 0; !OpenClipboard(app->hwnd); ++attempt)
+  {
+    if (attempt >= 19) return;
+    Sleep(10);
+  }
   HANDLE h = GetClipboardData(CF_UNICODETEXT);
   if (h)
   {
@@ -3174,16 +4658,16 @@ static void paste_clipboard(App *app)
             u64 old_line = app->cl;
             u64 old_col = app->cc;
             u64 pasted_newlines = 0;
-            bool did_caret_multiline = false;
             if (has_stream_selection(app)) delete_selection(app);
-            if (!line_paste && !has_stream_selection(app))
-              did_caret_multiline = apply_caret_multiline_paste(app, utf8, inserted_len);
-            if (!did_caret_multiline)
             {
               u64 off = line_paste ? doc_line_start(&app->doc, app->cl) : app->co;
               app_doc_insert(app, off, utf8, inserted_len);
               app->co = off + inserted_len;
-              for (int i = 0; i < bytes - 1; ++i)
+              if (!line_paste)
+              {
+                sync_caret_from_offsets(app);
+              }
+              for (int i = 0; line_paste && i < bytes - 1; ++i)
               {
                 if (utf8[i] == '\n')
                 {
@@ -3492,443 +4976,103 @@ static void move_caret_word_left(App *app)
     move_caret_left(app);
 }
 
+
+
 /******************************************************************************
- * Keyboard / Character Input
+ * Win32 Theme / Platform
  ******************************************************************************/
-static void handle_key(App *app, WPARAM vk)
+static void init_native_dark_mode(void)
 {
-  app->vsb = false;
-  bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-  bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-  bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-  u64 old_off = app->co;
-  bool moved = false;
-  if (vk == VK_ESCAPE)
-  {
-    if (shift)
-    {
-      DestroyWindow(app->hwnd);
-      return;
-    }
-    if (app->find_hwnd && IsWindow(app->find_hwnd))
-      DestroyWindow(app->find_hwnd);
-    else
-      PostMessageW(app->hwnd, WM_CLOSE, 0, 0);
-    return;
-  }
-  if (ctrl && vk == 'O') { open_dialog(app); return; }
-  if (ctrl && !shift && vk == 'S') { save_dialog(app); return; }
-  if (ctrl && shift && vk == 'S') { save_as_dialog(app); return; }
-  if (ctrl && vk == 'C')
-  {
-    if (has_box_selection(app))
-    {
-      copy_box_selection_to_clipboard(app);
-      app->clm = false;
-    }
-    else if (has_stream_selection(app))
-    {
-      copy_selection_or_current_line_to_clipboard(app);
-      app->clm = false;
-    }
-    else
-    {
-      copy_current_line_to_clipboard(app);
-      app->clm = true;
-    }
-    return;
-  }
-  if (ctrl && vk == 'X')
-  {
-    if (has_box_selection(app))
-    {
-      begin_edit_txn(app);
-      copy_box_selection_to_clipboard(app);
-      app->clm = false;
-      if (apply_basic_edit(app, NULL, 0, false, false))
-      {
-        update_title(app);
-        request_repaint(app, FALSE);
-      }
-      end_edit_txn(app);
-      return;
-    }
-    if (has_stream_selection(app))
-    {
-      begin_edit_txn(app);
-      copy_selection_or_current_line_to_clipboard(app);
-      app->clm = false;
-      if (delete_selection(app))
-      {
-        update_title(app);
-        request_repaint(app, FALSE);
-      }
-    }
-    else
-    {
-      u64 start = 0;
-      u64 end = 0;
-      u64 old_col = app->cc;
-      if (current_line_range(app, &start, &end))
-      {
-        copy_current_line_to_clipboard(app);
-        app->clm = true;
-        begin_edit_txn(app);
-        app_doc_delete(app, start, end - start);
-        app->co = start;
-        app->sa = app->co;
-        app->sv = app->co;
-        sync_caret_from_offsets(app);
-        set_caret_line_col(app, app->cl, old_col);
-        keep_caret_visible(app);
-        update_title(app);
-        request_repaint(app, FALSE);
-      }
-    }
-    end_edit_txn(app);
-    return;
-  }
-  if (ctrl && vk == 'A')
-  {
-    app->sa = 0;
-    app->sv = app->doc.len;
-    app->co = app->doc.len;
-    sync_caret_from_offsets(app);
-    keep_visible_and_repaint(app);
-    return;
-  }
-  if (ctrl && !shift && vk == 'Z') { perform_undo(app); return; }
-  if ((ctrl && !shift && vk == 'Y') || (ctrl && shift && vk == 'Z')) { perform_redo(app); return; }
-  if (ctrl && alt && vk == 'D') { run_codex_do_command(app); return; }
-  if (ctrl && shift && vk == 'D')
-  {
-    if (app->doc.dirty)
-      save_dialog(app);
-    if (run_codex_do_command(app))
-      PostMessageW(app->hwnd, WM_CLOSE, 0, 0);
-    return;
-  }
-  if (ctrl && (vk == VK_OEM_MINUS || vk == VK_SUBTRACT)) { apply_font_size(app, app->font_size - 2); return; }
-  if (ctrl && (vk == VK_OEM_PLUS || vk == VK_ADD)) { apply_font_size(app, app->font_size + 2); return; }
-  if (ctrl && (vk == '0' || vk == VK_NUMPAD0)) { apply_font_size(app, FONT_SIZE_DEFAULT); return; }
-  if (ctrl && vk == 'V') { paste_clipboard(app); return; }
-  if (ctrl && vk == 'F')
-  {
-    if (seed_find_query_from_selection(app))
-      find_next(app, app->fq);
-    else
-      open_find_dialog(app);
-    return;
-  }
-  if (vk == VK_F3) { find_next(app, app->fq); return; }
-  if (alt && !shift && (vk == VK_UP || vk == VK_DOWN))
-  {
-    if (move_caret_line_by_swap(app, vk == VK_DOWN))
-      update_title(app);
-    keep_visible_and_repaint(app);
-    return;
-  }
-  if (alt && shift &&
-      (vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT))
-  {
-    extend_box_selection(app, vk);
-    keep_visible_and_repaint(app);
-    return;
-  }
-  switch (vk)
-  {
-  case VK_LEFT:
-    if (ctrl) move_caret_word_left(app); else move_caret_left(app);
-    moved = true;
-    break;
-  case VK_RIGHT:
-    if (ctrl) move_caret_word_right(app); else move_caret_right(app);
-    moved = true;
-    break;
-  case VK_UP:
-    if (ctrl)
-    {
-      if (vscroll_can_line_up(app))
-      {
-        u64 old_tl = app->tl;
-        u64 bottom_visible;
-        app->vsb = false;
-        app->tl--;
-        bottom_visible = app->tl;
-        if (app->rows > 0) bottom_visible += (u64)app->rows - 1;
-        if (app->cl > bottom_visible)
-        {
-          set_caret_line_col(app, bottom_visible, app->cc);
-          moved = true;
-        }
-        else if (app->cl == old_tl && app->cl > 0)
-        {
-          set_caret_line_col(app, app->cl - 1, app->cc);
-          moved = true;
-        }
-      }
-    }
-    else
-    {
-      if (app->cl > 0)
-        set_caret_line_col(app, app->cl - 1, app->cc);
-      else
-        set_caret_line_col(app, 0, 0);
-      moved = true;
-    }
-    break;
-  case VK_DOWN:
-    if (ctrl)
-    {
-      if (vscroll_can_line_down(app))
-      {
-        u64 old_tl = app->tl;
-        u64 bottom_visible = old_tl;
-        if (app->rows > 0) bottom_visible += (u64)app->rows - 1;
-        app->vsb = false;
-        app->tl++;
-        if (app->cl < app->tl)
-        {
-          set_caret_line_col(app, app->tl, app->cc);
-          moved = true;
-        }
-        else if (app->cl >= bottom_visible)
-        {
-          doc_discover_for_view(&app->doc, app->cl, 2);
-          if (app->cl + 1 < app->doc.lines.count)
-            set_caret_line_col(app, app->cl + 1, app->cc);
-          else
-          {
-            u64 start = doc_line_start(&app->doc, app->cl);
-            u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
-            app->cc = end - start;
-            app->co = end;
-          }
-          moved = true;
-        }
-      }
-    }
-    else
-    {
-      doc_discover_for_view(&app->doc, app->cl, 2);
-      if (app->cl + 1 < app->doc.lines.count)
-        set_caret_line_col(app, app->cl + 1, app->cc);
-      else
-      {
-        u64 start = doc_line_start(&app->doc, app->cl);
-        u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
-        app->cc = end - start;
-        app->co = end;
-      }
-      moved = true;
-    }
-    break;
-  case VK_PRIOR:
-    set_caret_line_col(app, app->cl > (u64)app->rows ? app->cl - (u64)app->rows : 0, app->cc);
-    moved = true;
-    break;
-  case VK_NEXT:
-    set_caret_line_col(app, app->cl + (u64)app->rows, app->cc);
-    doc_discover_for_view(&app->doc, app->cl, (u64)app->rows);
-    moved = true;
-    break;
-  case VK_HOME:
-    set_caret_line_col(app, ctrl ? 0 : app->cl, 0);
-    moved = true;
-    break;
-  case VK_END:
-  {
-    u64 line = app->cl;
-    if (ctrl)
-    {
-      doc_discover_all_lines(&app->doc);
-      line = app->doc.lines.count ? app->doc.lines.count - 1 : 0;
-      app->cl = line;
-    }
-    u64 start = doc_line_start(&app->doc, line);
-    u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
-    app->cc = end - start;
-    app->co = end;
-    moved = true;
-  } break;
-  case VK_BACK:
-  {
-    if (has_box_selection(app))
-    {
-      apply_basic_edit(app, NULL, 0, true, false);
-      break;
-    }
-    if (has_stream_selection(app))
-    {
-      begin_edit_txn(app);
-      if (delete_selection(app))
-      {
-        update_title(app);
-        break;
-      }
-    }
-    if (ctrl && app->co > 0)
-    {
-      begin_edit_txn(app);
-      u64 old_off = app->co;
-      move_caret_word_left(app);
-      if (app->co < old_off)
-      {
-        app_doc_delete(app, app->co, old_off - app->co);
-        update_title(app);
-      }
-      break;
-    }
-    if (app->co > 0)
-    {
-      begin_edit_txn(app);
-      u64 off = app->co;
-      u64 del_start = off - 1;
-      u64 del = 1;
-      if (app->cc == 0 && app->cl > 0)
-      {
-        u64 prev_start = doc_line_start(&app->doc, app->cl - 1);
-        u64 prev_end = doc_line_length_clamped(&app->doc, prev_start, UINT32_MAX);
-        del_start = prev_end;
-        del = off - prev_end;
-        app->cl--;
-        app->cc = prev_end - prev_start;
-        app->co = del_start;
-      }
-      else
-      {
-        app->cc--;
-        app->co--;
-      }
-      app_doc_delete(app, del_start, del);
-      update_title(app);
-    }
-  } break;
-  case VK_DELETE:
-  {
-    if (has_box_selection(app))
-    {
-      apply_basic_edit(app, NULL, 0, false, true);
-      break;
-    }
-    if (has_stream_selection(app))
-    {
-      begin_edit_txn(app);
-      if (delete_selection(app))
-      {
-        update_title(app);
-        break;
-      }
-    }
-    if (ctrl && app->co < app->doc.len)
-    {
-      begin_edit_txn(app);
-      u64 old_off = app->co;
-      move_caret_word_right(app);
-      if (app->co > old_off)
-      {
-        u64 del_len = app->co - old_off;
-        app->co = old_off;
-        sync_caret_from_offsets(app);
-        app_doc_delete(app, old_off, del_len);
-        update_title(app);
-      }
-      break;
-    }
-    u64 off = app->co;
-    if (off < app->doc.len)
-    {
-      begin_edit_txn(app);
-      u64 del = 1;
-      char c[2] = {0, 0};
-      CopyCtx ctx = { c, 0 };
-      doc_read_range(&app->doc, off, min_u64(2, app->doc.len - off), copy_span, &ctx);
-      if (c[0] == '\r' && c[1] == '\n') del = 2;
-      app_doc_delete(app, off, del);
-      update_title(app);
-    }
-  } break;
-  default:
-    break;
-  }
-  if (moved)
-  {
-    if (has_box_selection(app) && !alt) clear_box_selection(app);
-    if (shift)
-    {
-      if (!has_stream_selection(app)) app->sa = old_off;
-      app->sv = app->co;
-    }
-    else
-      clear_stream_selection(app);
-  }
-  end_edit_txn(app);
-  keep_visible_and_repaint(app);
+  HMODULE theme = LoadLibraryW(L"uxtheme.dll");
+  if (!theme) return;
+  g_set_preferred_app_mode = (SetPreferredAppModeFn)GetProcAddress(theme, MAKEINTRESOURCEA(135));
+  g_allow_dark_mode_for_window = (AllowDarkModeForWindowFn)GetProcAddress(theme, MAKEINTRESOURCEA(133));
+  g_flush_menu_themes = (FlushMenuThemesFn)GetProcAddress(theme, MAKEINTRESOURCEA(136));
+  if (g_set_preferred_app_mode) g_set_preferred_app_mode(APP_MODE_FORCE_DARK);
+  if (g_flush_menu_themes) g_flush_menu_themes();
 }
 
-static void handle_char(App *app, WPARAM ch)
+static void apply_native_dark_mode(HWND hwnd)
 {
-  app->vsb = false;
-  char bytes[8];
-  int n = 0;
-  if (ch == L'\r')
-  {
-    bytes[0] = '\n';
-    n = 1;
-  }
-  else if (ch >= 32 && ch != 127)
-  {
-    WCHAR w[2] = {(WCHAR)ch, 0};
-    n = WideCharToMultiByte(CP_UTF8, 0, w, 1, bytes, (int)sizeof(bytes), NULL, NULL);
-  }
-  if (n > 0)
-  {
-    if (has_box_selection(app))
-    {
-      if (apply_basic_edit(app, bytes, (u64)n, false, false))
-        keep_visible_and_repaint(app);
-      return;
-    }
-    begin_edit_txn(app);
-    if (has_stream_selection(app)) delete_selection(app);
-    u64 off = app->co;
-    if (app_doc_insert(app, off, bytes, (u64)n))
-    {
-      app->co += (u64)n;
-      if (bytes[0] == '\n')
-      {
-        app->cl++;
-        app->cc = 0;
-      }
-      else
-        app->cc += (u64)n;
-      update_title(app);
-      clear_stream_selection(app);
-      keep_visible_and_repaint(app);
-    }
-    end_edit_txn(app);
-  }
+  BOOL enabled = TRUE;
+  COLORREF bg = THEME_BG;
+  COLORREF fg = THEME_FG;
+  if (g_allow_dark_mode_for_window) g_allow_dark_mode_for_window(hwnd, TRUE);
+  SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
+  DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enabled, sizeof(enabled));
+  DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &bg, sizeof(bg));
+  DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &bg, sizeof(bg));
+  DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &fg, sizeof(fg));
 }
 
-static int doc_copy_utf8_z(Document *doc, char **out_utf8)
+static int scroll_max_pos(const SCROLLINFO *si)
 {
-  *out_utf8 = NULL;
-  size_t n = (size_t)doc->len;
-  char *buf = (char *)malloc(n + 1);
-  if (!buf) return 0;
-  CopyCtx ctx = { buf, 0 };
-  doc_read_range(doc, 0, doc->len, copy_span, &ctx);
-  buf[n] = 0;
-  *out_utf8 = buf;
-  return (int)n;
+  int page = si->nPage > 0 ? (int)si->nPage : 1;
+  int max_pos = si->nMax - page + 1;
+  return max_pos > si->nMin ? max_pos : si->nMin;
 }
 
-static bool sync_path_utf8_on_change(App *app)
+static bool vscroll_can_line_up(const App *app)
 {
-  if (!app->doc.dirty) return false;
-  if (app->doc.path[0]) return true;
-  return app->doc.len != 0;
+  SCROLLINFO si;
+  int max_pos;
+  memset(&si, 0, sizeof(si));
+  si.cbSize = sizeof(si);
+  si.fMask = SIF_RANGE | SIF_PAGE;
+  if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
+  max_pos = scroll_max_pos(&si);
+  if (max_pos <= si.nMin) return false;
+  return app->tl > (u64)si.nMin;
 }
+
+static bool vscroll_can_line_down(App *app)
+{
+  SCROLLINFO si;
+  int max_pos;
+  memset(&si, 0, sizeof(si));
+  si.cbSize = sizeof(si);
+  si.fMask = SIF_RANGE | SIF_PAGE;
+  if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
+  max_pos = scroll_max_pos(&si);
+  if (max_pos <= si.nMin) return false;
+  if (app->tl < (u64)max_pos) return true;
+  if (!app->doc.lines.eof)
+  {
+    u64 budget_rows = (u64)(app->rows > 0 ? app->rows : 1);
+    doc_discover_for_view(&app->doc, app->tl + 1, budget_rows);
+    update_scrollbars(app);
+    memset(&si, 0, sizeof(si));
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE;
+    if (!GetScrollInfo(app->hwnd, SB_VERT, &si)) return false;
+    max_pos = scroll_max_pos(&si);
+  }
+  return app->tl < (u64)max_pos;
+}
+
+static bool cursor_at_vscroll_bottom(HWND hwnd)
+{
+  SCROLLBARINFO sbi;
+  POINT pt;
+  int arrow_h = GetSystemMetrics(SM_CYVSCROLL);
+  ZeroMemory(&sbi, sizeof(sbi));
+  sbi.cbSize = sizeof(sbi);
+  if (!GetCursorPos(&pt)) return false;
+  if (!GetScrollBarInfo(hwnd, OBJID_VSCROLL, &sbi)) return false;
+  if (pt.x < sbi.rcScrollBar.left || pt.x > sbi.rcScrollBar.right) return false;
+  return pt.y >= sbi.rcScrollBar.bottom - arrow_h * 2;
+}
+
+static int wheel_scroll_lines_per_notch(void)
+{
+  UINT lines = 0;
+  if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0)) return 3;
+  if (lines == WHEEL_PAGESCROLL) return -1;
+  if (lines == 0) return 0;
+  return (int)lines;
+}
+
+
 
 /******************************************************************************
  * Window Procedure
@@ -3936,30 +5080,21 @@ static bool sync_path_utf8_on_change(App *app)
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
   App *app = &g_app;
-  if (app->find_msg && msg == app->find_msg)
-  {
-    if (!app->find_hwnd || !IsWindow(app->find_hwnd)) return 0;
-    FINDREPLACEW *fr = (FINDREPLACEW *)lp;
-    if (!fr) return 0;
-    if (fr->Flags & FR_DIALOGTERM)
-    {
-      app->find_hwnd = NULL;
-      g_find_edit_wndproc = NULL;
-      g_find_button_wndproc = NULL;
-    }
-    else if (fr->Flags & FR_FINDNEXT)
-    {
-      update_find_count_label(app->find_hwnd);
-      find_next(app, app->fq);
-      {
-        HWND edit = GetDlgItem(app->find_hwnd, edt1);
-        if (edit) SetFocus(edit);
-      }
-    }
-    return 0;
-  }
   switch (msg)
   {
+  case WM_APP_RESTORE_EDITOR_FOCUS:
+    force_focus_window(hwnd);
+    if (app->cmd_restore_pending)
+    {
+      app->co = min_u64(app->cmd_saved_co, app->doc.len);
+      app->sa = min_u64(app->cmd_saved_sa, app->doc.len);
+      app->sv = min_u64(app->cmd_saved_sv, app->doc.len);
+      sync_caret_from_offsets(app);
+      keep_caret_visible(app);
+    }
+    app->cmd_restore_pending = false;
+    request_repaint(app, FALSE);
+    return 0;
   case WM_GETMINMAXINFO:
   {
     MINMAXINFO *mmi = (MINMAXINFO *)lp;
@@ -3975,7 +5110,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     app->hwnd = hwnd;
     apply_native_dark_mode(hwnd);
     app->bg_brush = CreateSolidBrush(THEME_BG);
-    g_find_bg_brush = CreateSolidBrush(THEME_BG);
+    app->cmd_bg_brush = CreateSolidBrush(THEME_CMD_POPUP_BG);
     app->font_size = FONT_SIZE_DEFAULT;
     apply_font_size(app, app->font_size);
     DragAcceptFiles(hwnd, TRUE);
@@ -3990,12 +5125,31 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
   }
   case WM_SIZE:
   {
+    RECT rc;
+    int client_w;
+    int client_h;
+    if (app->handling_main_wm_size)
+      return 0;
+    app->handling_main_wm_size = true;
+    if (!GetClientRect(hwnd, &rc)) SetRect(&rc, 0, 0, 0, 0);
+    client_w = rc.right - rc.left;
+    client_h = rc.bottom - rc.top;
+    if (client_w == app->last_client_w && client_h == app->last_client_h)
+    {
+      app->handling_main_wm_size = false;
+      return 0;
+    }
+    app->last_client_w = client_w;
+    app->last_client_h = client_h;
     HDC dc = GetDC(hwnd);
     recalc_metrics(app, dc);
     ReleaseDC(hwnd, dc);
     update_scrollbars(app);
+    repro_log_size((unsigned long)wp, client_w, client_h, app->rows, app->cols,
+                   (unsigned long long)app->tl, app->lcp);
     position_caret(app);
     InvalidateRect(hwnd, NULL, TRUE);
+    app->handling_main_wm_size = false;
     return 0;
   }
   case WM_SETFOCUS:
@@ -4050,15 +5204,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return 0;
   }
   case WM_KEYDOWN:
+    repro_begin_app_event(app, "key", (unsigned long)wp, (unsigned long)lp);
     handle_key(app, wp);
+    repro_end_app_event(app);
     return 0;
   case WM_SYSKEYDOWN:
     if (wp == VK_F4 && (GetKeyState(VK_MENU) & 0x8000) != 0)
       return DefWindowProcW(hwnd, msg, wp, lp);
+    repro_begin_app_event(app, "syskey", (unsigned long)wp, (unsigned long)lp);
     handle_key(app, wp);
+    repro_end_app_event(app);
     return 0;
   case WM_CHAR:
+    repro_begin_app_event(app, "char", (unsigned long)wp, (unsigned long)lp);
     handle_char(app, wp);
+    repro_end_app_event(app);
     return 0;
   case WM_GETTEXTLENGTH:
   {
@@ -4089,24 +5249,81 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
   }
   case WM_MOUSEWHEEL:
   {
+    u64 tl_before = app->tl;
+    int wheel_delta = GET_WHEEL_DELTA_WPARAM(wp);
+    int wheel_notches = 0;
+    int lines_per_notch = 0;
     if ((GetKeyState(VK_CONTROL) & 0x8000) != 0)
     {
-      int z = GET_WHEEL_DELTA_WPARAM(wp);
-      int steps = z / WHEEL_DELTA;
+      int z = wheel_delta;
+      int steps;
+      app->zoom_wheel_delta_remainder += z;
+      steps = app->zoom_wheel_delta_remainder / WHEEL_DELTA;
+      app->zoom_wheel_delta_remainder -= steps * WHEEL_DELTA;
       if (steps != 0) apply_font_size(app, app->font_size + (steps * 2));
       return 0;
     }
     if (app->lcp) return 0;
     app->vsb = false;
-    int z = GET_WHEEL_DELTA_WPARAM(wp);
-    int lines = z / WHEEL_DELTA;
-    if (lines > 0)
-      app->tl = app->tl > (u64)(lines * 3) ? app->tl - (u64)(lines * 3) : 0;
-    else if (lines < 0)
-      app->tl += (u64)((-lines) * 3);
+    /* Suppress keep_caret_visible() before any scrollbar/layout work, because
+     re-entrant WM_SIZE during ShowScrollBar/SetScrollInfo can otherwise snap
+     tl back to the caret line mid-wheel handling. */
+    app->skip_keep_caret_visible_once = true;
+    {
+      int z = wheel_delta;
+      int notches;
+      lines_per_notch = wheel_scroll_lines_per_notch();
+      app->wheel_delta_remainder += z;
+      notches = app->wheel_delta_remainder / WHEEL_DELTA;
+      app->wheel_delta_remainder -= notches * WHEEL_DELTA;
+      wheel_notches = notches;
+      if (lines_per_notch != 0 && notches != 0)
+      {
+        if (lines_per_notch < 0)
+          lines_per_notch = app->rows > 0 ? app->rows : 1;
+        {
+          int steps = (notches > 0 ? notches : -notches) * lines_per_notch;
+          if (notches > 0)
+          {
+            while (steps-- > 0)
+            {
+              if (app->tl == 0) break;
+              app->tl--;
+            }
+          }
+          else
+          {
+            /* Apply wheel-down delta in one shot, then clamp once.
+             Per-step update_scrollbars() can re-enter via scrollbar visibility
+             changes and transiently decrease tl, which falsely trips the
+             previous early-break logic and makes scrolling appear stuck. */
+            u64 delta = (u64)steps;
+            if (UINT64_MAX - app->tl < delta)
+              app->tl = UINT64_MAX;
+            else
+              app->tl += delta;
+          }
+        }
+      }
+    }
     update_scrollbars(app);
-    app->cl = app->tl;
-    set_caret_line_col(app, app->cl, app->cc);
+    preserve_caret_row_for_scroll(app, tl_before);
+    {
+      SCROLLINFO si;
+      int max_pos = 0;
+      int pos = 0;
+      memset(&si, 0, sizeof(si));
+      si.cbSize = sizeof(si);
+      si.fMask = SIF_ALL;
+      if (GetScrollInfo(hwnd, SB_VERT, &si))
+      {
+        max_pos = scroll_max_pos(&si);
+        pos = si.nPos;
+      }
+      repro_log_wheel(wheel_delta, app->wheel_delta_remainder, wheel_notches, lines_per_notch,
+                      (unsigned long long)tl_before, (unsigned long long)app->tl,
+                      pos, max_pos, app->lcp, app->rows);
+    }
     request_repaint(app, FALSE);
     return 0;
   }
@@ -4136,6 +5353,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
   case WM_VSCROLL:
   {
     if (app->lcp) return 0;
+    u64 tl_before = app->tl;
     int code = LOWORD(wp);
     SCROLLINFO si;
     int max_pos;
@@ -4177,8 +5395,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
       app->vsb = false;
       break;
     }
+    /* Same re-entrancy guard as wheel: avoid caret-driven tl correction while
+     the scroll action is still resolving nested size/scrollbar messages. */
+    app->skip_keep_caret_visible_once = true;
     update_scrollbars(app);
-    set_caret_line_col(app, app->tl, app->cc);
+    repro_log_vscroll(code, si.nPos, si.nTrackPos, max_pos,
+                      (unsigned long long)tl_before, (unsigned long long)app->tl, app->vsb);
+    preserve_caret_row_for_scroll(app, tl_before);
     request_repaint(app, FALSE);
     return 0;
   }
@@ -4202,12 +5425,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
       break;
     default: break;
     }
+    /* Prevent immediate caret-visibility correction from snapping fc back to
+     caret column while horizontal scrollbar interaction is in-flight. */
+    app->skip_keep_caret_visible_once = true;
     update_scrollbars(app);
+    clamp_caret_to_horizontal_view(app);
+    /* update_scrollbars() can re-enter through WM_SIZE when scrollbar
+     visibility changes. Re-arm the guard so the final caret positioning for
+     this repaint still respects the scrollbar-driven horizontal offset. */
+    app->skip_keep_caret_visible_once = true;
     request_repaint(app, FALSE);
     return 0;
   }
   case WM_LBUTTONDOWN:
   {
+    repro_begin_app_event(app, "ldown", (unsigned long)GET_X_LPARAM(lp), (unsigned long)GET_Y_LPARAM(lp));
     app->vsb = false;
     SetFocus(hwnd);
     int x = GET_X_LPARAM(lp);
@@ -4224,8 +5456,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
       app->bcl = app->cl;
       app->bcc = app->cc;
       app->bdc = app->cc;
-      app->sa = app->co;
-      app->sv = app->co;
+      collapse_stream_selection_to_caret(app);
       app->sbxm = true;
     }
     else if (shift)
@@ -4244,15 +5475,26 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     app->swm = true;
     SetCapture(hwnd);
     request_repaint(app, FALSE);
+    repro_end_app_event(app);
     return 0;
   }
   case WM_LBUTTONDBLCLK:
   {
+    repro_begin_app_event(app, "ldbl", (unsigned long)GET_X_LPARAM(lp), (unsigned long)GET_Y_LPARAM(lp));
     int x = GET_X_LPARAM(lp);
     int y = GET_Y_LPARAM(lp);
     app->vsb = false;
     SetFocus(hwnd);
     set_caret_from_xy(app, x, y);
+    if (x < app->gutter_w + EDIT_TEXT_LEFT_PADDING)
+    {
+      clear_stream_selection(app);
+      app->swdm = false;
+      app->swm = false;
+      request_repaint(app, FALSE);
+      repro_end_app_event(app);
+      return 0;
+    }
     select_word_at_caret(app);
     app->swdm = true;
     app->wdas = min_u64(app->sa, app->sv);
@@ -4261,11 +5503,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     SetCapture(hwnd);
     keep_caret_visible(app);
     request_repaint(app, FALSE);
+    repro_end_app_event(app);
     return 0;
   }
   case WM_MOUSEMOVE:
     if (app->swm && (wp & MK_LBUTTON))
     {
+      repro_begin_app_event(app, "move", (unsigned long)GET_X_LPARAM(lp), (unsigned long)GET_Y_LPARAM(lp));
       int x = GET_X_LPARAM(lp);
       int y = GET_Y_LPARAM(lp);
       set_caret_from_xy(app, x, y);
@@ -4279,8 +5523,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
           clear_box_selection(app);
         else
           app->bsa = true;
-        app->sa = app->co;
-        app->sv = app->co;
+        collapse_stream_selection_to_caret(app);
       }
       else if (app->swdm)
       {
@@ -4307,16 +5550,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         app->sv = app->co;
       keep_caret_visible(app);
       request_repaint(app, FALSE);
+      repro_end_app_event(app);
       return 0;
     }
     break;
   case WM_LBUTTONUP:
     if (app->swm)
     {
+      repro_begin_app_event(app, "lup", (unsigned long)GET_X_LPARAM(lp), (unsigned long)GET_Y_LPARAM(lp));
       app->swm = false;
       app->sbxm = false;
       app->swdm = false;
       ReleaseCapture();
+      repro_end_app_event(app);
       return 0;
     }
     break;
@@ -4340,11 +5586,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
   case WM_TIMER:
     if (wp == LINECOUNT_TIMER_ID && app->lcp)
     {
-      ULONGLONG start = GetTickCount64();
+      ULONGLONG start = monotonic_tick_ms();
       while (!app->doc.lines.eof)
       {
         doc_discover_step(&app->doc, LINE_DISCOVERY_ASYNC_CHUNK);
-        if (GetTickCount64() - start >= LINE_DISCOVERY_ASYNC_SLICE_MS) break;
+        if (monotonic_tick_ms() - start >= LINE_DISCOVERY_ASYNC_SLICE_MS) break;
       }
       if (app->doc.lines.eof)
       {
@@ -4357,11 +5603,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     break;
   case WM_DESTROY:
+    repro_shutdown();
     apply_scroll_limits_and_position(app);
     if (app->swm) ReleaseCapture();
     clear_history();
-    if (g_find_bg_brush) DeleteObject(g_find_bg_brush);
-    g_find_bg_brush = NULL;
+    if (app->cmd_bg_brush) DeleteObject(app->cmd_bg_brush);
+    app->cmd_bg_brush = NULL;
     if (app->bg_brush) DeleteObject(app->bg_brush);
     doc_clear(&app->doc);
     if (app->font) DeleteObject(app->font);
@@ -4377,8 +5624,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
   (void)prev;
   (void)cmd;
   memset(&g_app, 0, sizeof(g_app));
+  repro_init();
   init_native_dark_mode();
-  g_app.find_msg = RegisterWindowMessageW(FINDMSGSTRING);
   doc_set_empty(&g_app.doc);
   int argc = 0;
   WCHAR **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -4390,6 +5637,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
   }
   if (argv) LocalFree(argv);
   WNDCLASSW wc;
+  WNDCLASSW cmd_wc;
+  WNDCLASSW find_wc;
   memset(&wc, 0, sizeof(wc));
   wc.style = CS_DBLCLKS;
   wc.lpfnWndProc = wnd_proc;
@@ -4398,6 +5647,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
   wc.hCursor = LoadCursorW(NULL, IDC_IBEAM);
   wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
   RegisterClassW(&wc);
+  memset(&cmd_wc, 0, sizeof(cmd_wc));
+  cmd_wc.lpfnWndProc = command_popup_wndproc;
+  cmd_wc.hInstance = inst;
+  cmd_wc.lpszClassName = CMD_POPUP_CLASS_NAME;
+  cmd_wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+  cmd_wc.hbrBackground = NULL;
+  RegisterClassW(&cmd_wc);
+  memset(&find_wc, 0, sizeof(find_wc));
+  find_wc.lpfnWndProc = find_popup_wndproc;
+  find_wc.hInstance = inst;
+  find_wc.lpszClassName = FIND_POPUP_CLASS_NAME;
+  find_wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+  find_wc.hbrBackground = NULL;
+  RegisterClassW(&find_wc);
   HWND hwnd = CreateWindowExW(0, APP_CLASS_NAME, L"text", WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL,
                               CW_USEDEFAULT, CW_USEDEFAULT, 480, 520, NULL, NULL, inst, NULL);
   if (!hwnd) return 1;
@@ -4411,3 +5674,4 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
   }
   return (int)msg.wParam;
 }
+
