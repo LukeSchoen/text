@@ -1,0 +1,16 @@
+## Local/generated project data
+/.build/
+/test.txt
+
+## Compiler intermediates
+*.obj
+*.ilk
+*.pdb
+*.idb
+*.exp
+*.lib
+
+## Visual Studio / Windows
+.vs/
+*.user
+Thumbs.db

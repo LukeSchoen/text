@@ -1,0 +1,3 @@
+clean:line:clean/improve this line of text
+compact:line:shorten/compact this line of text
+spelling:line:fix the spelling on this line of text
