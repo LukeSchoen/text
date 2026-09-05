@@ -36,6 +36,7 @@ call "%~dp0runtests.cmd" ^
   selectissue_md_select_three_lines_backspace ^
   double_click_word_selection_copy ^
   ctrl_c_no_selection_single_line_copy_paste ^
+  save_mapped_file_leaves_no_replacement_temp ^
   duplicate_open_clean_peer_reloads_after_save ^
   duplicate_open_dirty_peer_requires_explicit_overwrite ^
   deleted_file_keeps_editor_copy_until_explicit_recreate

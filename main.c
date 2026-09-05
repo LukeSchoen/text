@@ -1499,6 +1499,71 @@ static bool make_save_temp_path(const WCHAR *path, WCHAR *out, size_t out_count)
   return false;
 }
 
+static bool make_save_backup_path(const WCHAR *path, WCHAR *out, size_t out_count)
+{
+  DWORD pid = GetCurrentProcessId();
+  DWORD tick = GetTickCount();
+  for (int i = 0; i < 100; ++i)
+  {
+    if (wfmt(out, out_count, L"%ls~text-save-%lu-%lu-%d.tmp", path,
+             (unsigned long)pid, (unsigned long)tick, i) < 0)
+      return false;
+    if (GetFileAttributesW(out) == INVALID_FILE_ATTRIBUTES)
+      return true;
+  }
+  return false;
+}
+
+static bool delete_replaced_backup(const WCHAR *path, DWORD *error_out)
+{
+  typedef BOOL (WINAPI *SetFileInformationByHandleFn)(HANDLE, int, LPVOID, DWORD);
+  typedef struct FileDispositionInfoExCompat
+  {
+    DWORD flags;
+  } FileDispositionInfoExCompat;
+  enum
+  {
+    FILE_DISPOSITION_INFO_EX_CLASS = 21,
+    FILE_DISPOSITION_DELETE_COMPAT = 0x00000001,
+    FILE_DISPOSITION_POSIX_SEMANTICS_COMPAT = 0x00000002
+  };
+  SetFileInformationByHandleFn set_file_information;
+  FileDispositionInfoExCompat disposition;
+  HANDLE f;
+  DWORD error = ERROR_SUCCESS;
+
+  if (error_out) *error_out = ERROR_SUCCESS;
+  if (!path || !path[0]) return true;
+  if (DeleteFileW(path)) return true;
+  error = GetLastError();
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return true;
+
+  /* A peer editor may still have the replaced file mapped. POSIX disposition
+     removes the backup name while those existing mappings keep their bytes. */
+  set_file_information = (SetFileInformationByHandleFn)GetProcAddress(
+      GetModuleHandleW(L"kernel32.dll"), "SetFileInformationByHandle");
+  f = CreateFileW(path, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (f != INVALID_HANDLE_VALUE)
+  {
+    disposition.flags = FILE_DISPOSITION_DELETE_COMPAT |
+                        FILE_DISPOSITION_POSIX_SEMANTICS_COMPAT;
+    if (set_file_information &&
+        set_file_information(f, FILE_DISPOSITION_INFO_EX_CLASS,
+                             &disposition, (DWORD)sizeof(disposition)))
+    {
+      CloseHandle(f);
+      return true;
+    }
+    error = GetLastError();
+    CloseHandle(f);
+  }
+  else
+    error = GetLastError();
+  if (error_out) *error_out = error;
+  return false;
+}
+
 static bool doc_prepare_save(Document *doc, const WCHAR *path, PreparedSave *prepared)
 {
   FileProbe probe;
@@ -1573,12 +1638,17 @@ static void release_save_mutex(HANDLE mutex)
 }
 
 static bool doc_commit_prepared_save(Document *doc, const WCHAR *path,
-                                     const WCHAR *path_key, PreparedSave *prepared)
+                                     const WCHAR *path_key, PreparedSave *prepared,
+                                     DWORD *cleanup_error)
 {
   typedef BOOL (WINAPI *ReplaceFileWFn)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPVOID, LPVOID);
+  WCHAR backup_path[MAX_PATH + 80];
   FileStamp saved_stamp;
   ReplaceFileWFn replace_file;
+  bool has_backup = false;
+  if (cleanup_error) *cleanup_error = ERROR_SUCCESS;
   if (!prepared->ready) return false;
+  backup_path[0] = 0;
   saved_stamp = prepared->stamp;
   if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
   {
@@ -1586,16 +1656,25 @@ static bool doc_commit_prepared_save(Document *doc, const WCHAR *path,
   }
   else
   {
+    if (!make_save_backup_path(path, backup_path, _countof(backup_path)))
+    {
+      SetLastError(ERROR_CANNOT_MAKE);
+      return false;
+    }
     replace_file = (ReplaceFileWFn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReplaceFileW");
-    if (!replace_file || !replace_file(path, prepared->temp_path, NULL,
+    if (!replace_file || !replace_file(path, prepared->temp_path, backup_path,
                                        REPLACEFILE_WRITE_THROUGH, NULL, NULL))
       return false;
+    has_backup = true;
   }
   prepared->ready = false;
   prepared->temp_path[0] = 0;
   /* The disk commit already succeeded. Flattening is a best-effort cleanup if
      allocation pressure prevents rebuilding the one-piece saved baseline. */
   doc_flatten_to_one_add_piece(doc);
+  if (has_backup && !delete_replaced_backup(backup_path, cleanup_error) &&
+      cleanup_error && *cleanup_error == ERROR_SUCCESS)
+    *cleanup_error = ERROR_ACCESS_DENIED;
   doc->dirty = false;
   doc_set_disk_baseline(doc, path, path_key, &saved_stamp);
   /* Never adopt a later writer's stamp as ours. A writer that won immediately
@@ -4486,7 +4565,8 @@ static bool app_save_to_path_approved(App *app, const WCHAR *path, bool save_as,
       has_approval = true;
       continue;
     }
-    if (!doc_commit_prepared_save(&app->doc, path, path_key, &prepared))
+    DWORD cleanup_error = ERROR_SUCCESS;
+    if (!doc_commit_prepared_save(&app->doc, path, path_key, &prepared, &cleanup_error))
     {
       DWORD save_error = GetLastError();
       WCHAR message[256];
@@ -4501,6 +4581,14 @@ static bool app_save_to_path_approved(App *app, const WCHAR *path, bool save_as,
     release_save_mutex(mutex);
     clear_history();
     update_title(app);
+    if (cleanup_error != ERROR_SUCCESS)
+    {
+      WCHAR message[256];
+      wfmt(message, _countof(message),
+           L"The file was saved, but its temporary backup could not be removed "
+           L"(Windows error %lu).", (unsigned long)cleanup_error);
+      MessageBoxW(app->hwnd, message, L"text", MB_ICONWARNING | MB_OK);
+    }
     return true;
   }
 }

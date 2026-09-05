@@ -1455,6 +1455,42 @@ static BOOL wait_for_file_text(const wchar_t *path, const char *expected) {
     return wait_until_true(TEST_UI_TIMEOUT_MS * 2, file_text_matches, &wait);
 }
 
+static BOOL find_save_artifact(const wchar_t *path, wchar_t *found, size_t found_count) {
+    WIN32_FIND_DATAW data;
+    HANDLE search;
+    wchar_t pattern[MAX_PATH + 96];
+    const wchar_t *base;
+    size_t base_len;
+
+    if (found && found_count) found[0] = 0;
+    if (swprintf_trunc(pattern, COUNT_OF(pattern), L"%ls*", path) < 0) return FALSE;
+    base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    base_len = wcslen(base);
+    search = FindFirstFileW(pattern, &data);
+    if (search == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            wcsncmp(data.cFileName, base, base_len) == 0 &&
+            data.cFileName[base_len] != 0) {
+            if (found && found_count)
+                swprintf_trunc(found, found_count, L"%.*ls%ls", (int)(base - path), path,
+                               data.cFileName);
+            FindClose(search);
+            return TRUE;
+        }
+    } while (FindNextFileW(search, &data));
+    FindClose(search);
+    return FALSE;
+}
+
+static void delete_save_artifacts(const wchar_t *path) {
+    wchar_t artifact[MAX_PATH + 96];
+    while (find_save_artifact(path, artifact, COUNT_OF(artifact))) {
+        if (!DeleteFileW(artifact)) break;
+    }
+}
+
 static const char g_selectissue_code_text[] =
     "reproduce this issue with a test case\r\n"
     "then fix and test till its all green\r\n\r\n"
@@ -7076,6 +7112,52 @@ static BOOL test_deleted_file_keeps_editor_copy_until_explicit_recreate(void) {
     return TRUE;
 }
 
+static BOOL test_save_mapped_file_leaves_no_replacement_temp(void) {
+    const char *test_name = "save_mapped_file_leaves_no_replacement_temp";
+    TestApp app;
+    wchar_t fixture[MAX_PATH];
+    wchar_t artifact[MAX_PATH + 96];
+
+    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "base"))
+        return FALSE;
+    if (!focus_app_window(app.window)) {
+        close_app(&app);
+        DeleteFileW(fixture);
+        fail_message(test_name, "could not focus app window");
+        return FALSE;
+    }
+
+    send_modified_press(VK_CONTROL, 0, VK_END);
+    send_key_press('X');
+    if (!wait_for_window_text(app.window, L"basex")) {
+        fail_text_mismatch(test_name, app.window, L"basex");
+        close_app(&app);
+        DeleteFileW(fixture);
+        return FALSE;
+    }
+    send_modified_press(VK_CONTROL, 0, 'S');
+    if (!wait_for_file_text(fixture, "basex")) {
+        debug_print_process_dialog(app.pi.dwProcessId);
+        close_app(&app);
+        DeleteFileW(fixture);
+        delete_save_artifacts(fixture);
+        fail_message(test_name, "save was not committed");
+        return FALSE;
+    }
+    if (find_save_artifact(fixture, artifact, COUNT_OF(artifact))) {
+        fwprintf(stderr, L"  debug: leftover save artifact=[%ls]\n", artifact);
+        close_app(&app);
+        DeleteFileW(fixture);
+        delete_save_artifacts(fixture);
+        fail_message(test_name, "successful save left a sibling temporary file");
+        return FALSE;
+    }
+
+    close_app(&app);
+    DeleteFileW(fixture);
+    return TRUE;
+}
+
 static TestCase g_tests[] = {
     {"launches_new_window_class", test_launches_new_window_class},
     {"ctrl_n_opens_fresh_new_window", test_ctrl_n_opens_fresh_new_window},
@@ -7194,6 +7276,7 @@ static TestCase g_tests[] = {
     {"duplicate_open_clean_peer_reloads_after_save", test_duplicate_open_clean_peer_reloads_after_save},
     {"duplicate_open_dirty_peer_requires_explicit_overwrite", test_duplicate_open_dirty_peer_requires_explicit_overwrite},
     {"deleted_file_keeps_editor_copy_until_explicit_recreate", test_deleted_file_keeps_editor_copy_until_explicit_recreate},
+    {"save_mapped_file_leaves_no_replacement_temp", test_save_mapped_file_leaves_no_replacement_temp},
 };
 
 static BOOL should_run_test(const TestCase *test, int argc, wchar_t **argv) {
