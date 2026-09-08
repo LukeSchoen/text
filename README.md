@@ -18,8 +18,8 @@ line to open it directly.
 ## Install and uninstall
 
 Run `install.cmd` beside `text.exe` to register file associations, script edit
-actions, and a **Text** shortcut in your Windows account's Start menu. Then open
-Start or taskbar search and type **Text**. Windows may take a moment to discover
+actions, and a **text** shortcut in your Windows account's Start menu. Then open
+Start or taskbar search and type **text**. Windows may take a moment to discover
 the shortcut; the installer cannot guarantee the first search result.
 
 Keep the folder in place, or rerun `install.cmd` after moving it to update the

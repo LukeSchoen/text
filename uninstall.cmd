@@ -12,10 +12,10 @@ set "EDIT_ONLY_EXTENSIONS=.bat .cmd .ps1 .sh .py .rb"
 set "LEGACY_SCRIPT_EXTENSIONS=.bat .cmd .ps1 .sh .py .rb"
 set "WINDOWS_EDIT_PROGIDS=batfile cmdfile"
 
-echo Removing the Text Start menu shortcuts...
-powershell.exe -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; $programs = [Environment]::GetFolderPath('Programs'); if (-not $programs) { throw 'Cannot locate the Start menu Programs folder.' }; foreach ($name in @('Text.lnk', 'Notepad (Text).lnk')) { $path = Join-Path $programs $name; if (Test-Path -LiteralPath $path) { $shell = New-Object -ComObject WScript.Shell; $shortcut = $shell.CreateShortcut($path); if ($shortcut.TargetPath -ieq $env:EXE) { Remove-Item -LiteralPath $path -Force } else { Write-Host ('Keeping ' + $name + ' because it points to another installation.') } } }"
+echo Removing the text Start menu shortcuts...
+powershell.exe -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; $programs = [Environment]::GetFolderPath('Programs'); if (-not $programs) { throw 'Cannot locate the Start menu Programs folder.' }; foreach ($name in @('text.lnk', 'Notepad (Text).lnk')) { $path = Join-Path $programs $name; if (Test-Path -LiteralPath $path) { $shell = New-Object -ComObject WScript.Shell; $shortcut = $shell.CreateShortcut($path); if ($shortcut.TargetPath -ieq $env:EXE) { Remove-Item -LiteralPath $path -Force } else { Write-Host ('Keeping ' + $name + ' because it points to another installation.') } } }"
 if errorlevel 1 (
-    echo Failed to remove the Text Start menu shortcuts.
+    echo Failed to remove the text Start menu shortcuts.
     exit /b 1
 )
 

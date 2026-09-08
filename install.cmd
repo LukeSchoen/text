@@ -16,10 +16,10 @@ if not exist "%EXE%" (
     exit /b 1
 )
 
-echo Adding Text to the Start menu and Windows search...
-powershell.exe -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; $programs = [Environment]::GetFolderPath('Programs'); if (-not $programs) { throw 'Cannot locate the Start menu Programs folder.' }; [IO.Directory]::CreateDirectory($programs) | Out-Null; $shell = New-Object -ComObject WScript.Shell; $shortcut = $shell.CreateShortcut((Join-Path $programs 'Text.lnk')); $shortcut.TargetPath = $env:EXE; $shortcut.Arguments = ''; $shortcut.WorkingDirectory = $env:SCRIPT_DIR; $shortcut.IconLocation = $env:EXE + ',0'; $shortcut.Description = 'Text - Fast text editor'; $shortcut.Save(); $legacyPath = Join-Path $programs 'Notepad (Text).lnk'; if (Test-Path -LiteralPath $legacyPath) { $legacy = $shell.CreateShortcut($legacyPath); if ($legacy.TargetPath -ieq $env:EXE) { Remove-Item -LiteralPath $legacyPath -Force } }"
+echo Adding text to the Start menu and Windows search...
+powershell.exe -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; $programs = [Environment]::GetFolderPath('Programs'); if (-not $programs) { throw 'Cannot locate the Start menu Programs folder.' }; [IO.Directory]::CreateDirectory($programs) | Out-Null; $shell = New-Object -ComObject WScript.Shell; $shortcutPath = Join-Path $programs 'text.lnk'; if (Test-Path -LiteralPath $shortcutPath) { $existing = Get-Item -LiteralPath $shortcutPath; if ($existing.Name -cne 'text.lnk') { Rename-Item -LiteralPath $existing.FullName -NewName 'text.lnk' } }; $shortcut = $shell.CreateShortcut($shortcutPath); $shortcut.TargetPath = $env:EXE; $shortcut.Arguments = ''; $shortcut.WorkingDirectory = $env:SCRIPT_DIR; $shortcut.IconLocation = $env:EXE + ',0'; $shortcut.Description = 'text - Fast text editor'; $shortcut.Save(); $legacyPath = Join-Path $programs 'Notepad (Text).lnk'; if (Test-Path -LiteralPath $legacyPath) { $legacy = $shell.CreateShortcut($legacyPath); if ($legacy.TargetPath -ieq $env:EXE) { Remove-Item -LiteralPath $legacyPath -Force } }"
 if errorlevel 1 (
-    echo Failed to create the Text Start menu shortcuts.
+    echo Failed to create the text Start menu shortcuts.
     exit /b 1
 )
 
@@ -68,7 +68,7 @@ for %%P in (%WINDOWS_EDIT_PROGIDS%) do (
 )
 
 echo Installed default file associations for document files.
-echo Added Text to the Start menu. Search for Text to launch it.
+echo Added text to the Start menu. Search for text to launch it.
 echo Windows search may take a moment to update; Windows controls result ranking.
 echo Added an "Edit with Text" context-menu action for script files.
 echo Made Text the default right-click Edit command for .bat and .cmd files.
