@@ -260,13 +260,26 @@ static void large_fixture(const char *path)
 }
 #endif
 
-int main(int argc, char **argv)
-{
+static const char *active_test;
+static double test_started;
+static void failed_timing(void) {
+    if (active_test) printf("FAIL %s (%.3f ms)\n", active_test, now_ms() - test_started);
+}
+#define RUN(name, expression) do { \
+    active_test = name; test_started = now_ms(); \
+    expression; \
+    printf("PASS %s (%.3f ms)\n", name, now_ms() - test_started); \
+    active_test = NULL; \
+} while (0)
+int main(int argc, char **argv) {
     double start = now_ms();
-    boundaries(); randomized(); allocation_failures(); structure_and_overflow();
+    atexit(failed_timing);
+    RUN("boundaries_and_ownership", boundaries());
+    RUN("randomized_edits_and_snapshots", randomized());
+    RUN("allocation_failures", allocation_failures());
+    RUN("structure_and_overflow", structure_and_overflow());
 #ifdef _WIN32
-    if (argc > 1) large_fixture(argv[1]);
-    else puts("Large file test skipped: supply a fixture path.");
+    if (argc > 1) RUN("large_mapped_fixture", large_fixture(argv[1]));
 #else
     (void)argc; (void)argv;
 #endif

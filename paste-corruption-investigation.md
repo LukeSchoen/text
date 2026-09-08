@@ -8,10 +8,11 @@ and box editing use scalar boundaries while the document continues to use byte
 offsets and piece storage. UTF-16 keyboard surrogate pairs are combined before
 conversion to UTF-8.
 
-`paste_corruption_repro.c` now asserts correct behavior rather than expecting
-corruption. Run `RunTests_Utf8.cmd`; this also runs renderer/decoder unit checks in
-`text_utf8_tests.c`. The dedicated suite is included in `RunTests_Pedantic.cmd`;
-the lean default suite is unchanged.
+The correctness regressions now live in `text_blackbox_tests.c` as
+`paste_boundaries`, `unicode_scalars` and `unicode_columns`. Run
+`RunTests_UserSimPedantic.cmd` for GUI coverage, or `runtests.cmd` for the
+renderer/decoder checks in `text_tests.c`. The standalone repro executable and
+Utf8 runner have been removed; the investigation commands below are historical.
 
 Confirmed with real keyboard/mouse input:
 

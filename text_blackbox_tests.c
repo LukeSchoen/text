@@ -78,6 +78,7 @@ typedef struct DragDebug {
 static wchar_t g_exe_path[MAX_PATH];
 static wchar_t g_look_dir[MAX_PATH];
 static int g_failures;
+static ULONGLONG g_input_ms, g_wait_ms, g_launch_ms;
 static DragDebug g_last_drag;
 
 static ULONGLONG monotonic_tick_ms(void) {
@@ -114,13 +115,16 @@ static void pump_messages_briefly(void) {
 }
 
 static BOOL wait_until_true(DWORD timeout_ms, WaitPredicateFn predicate, void *ctx) {
-    ULONGLONG deadline = monotonic_tick_ms() + timeout_ms;
+    ULONGLONG started = monotonic_tick_ms();
+    ULONGLONG deadline = started + timeout_ms;
 
     while (monotonic_tick_ms() <= deadline) {
-        if (predicate(ctx)) return TRUE;
+        if (predicate(ctx)) { g_wait_ms += monotonic_tick_ms() - started; return TRUE; }
         pump_messages_briefly();
     }
-    return predicate(ctx);
+    BOOL result = predicate(ctx);
+    g_wait_ms += monotonic_tick_ms() - started;
+    return result;
 }
 
 static void fail_message(const char *test_name, const char *message) {
@@ -606,6 +610,7 @@ static BOOL main_window_exists(void *ctx) {
 static BOOL launch_app_with_argument(TestApp *app, const wchar_t *argument) {
     STARTUPINFOW si;
     wchar_t cmdline[MAX_PATH * 4];
+    ULONGLONG started = monotonic_tick_ms();
 
     ZeroMemory(app, sizeof(*app));
     ZeroMemory(&si, sizeof(si));
@@ -615,7 +620,10 @@ static BOOL launch_app_with_argument(TestApp *app, const wchar_t *argument) {
 
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &app->pi)) return FALSE;
     WaitForInputIdle(app->pi.hProcess, TEST_STARTUP_TIMEOUT_MS);
-    if (wait_until_true(TEST_STARTUP_TIMEOUT_MS, main_window_exists, app)) return TRUE;
+    if (wait_until_true(TEST_STARTUP_TIMEOUT_MS, main_window_exists, app)) {
+        g_launch_ms += monotonic_tick_ms() - started;
+        return TRUE;
+    }
 
     if (app->pi.hProcess) {
         TerminateProcess(app->pi.hProcess, 1);
@@ -798,8 +806,11 @@ static INPUT make_mouse_wheel(LONG amount) {
 }
 
 static void send_inputs(INPUT *inputs, UINT count) {
-    SendInput(count, inputs, sizeof(INPUT));
+    ULONGLONG started = monotonic_tick_ms();
+    if (SendInput(count, inputs, sizeof(INPUT)) != count)
+        fail_message("input", "SendInput did not deliver the complete sequence");
     pump_messages_briefly();
+    g_input_ms += monotonic_tick_ms() - started;
 }
 
 static void send_key_press(WORD vk) {
@@ -822,30 +833,32 @@ static void send_unicode_char(wchar_t ch) {
 
 static void send_unicode_string(const wchar_t *text) {
     if (!text) return;
-    for (; *text; ++text) send_unicode_char(*text);
+    while (*text) {
+        INPUT keys[128];
+        UINT count = 0;
+        ZeroMemory(keys, sizeof(keys));
+        while (*text && count + 2 <= COUNT_OF(keys)) {
+            keys[count].type = INPUT_KEYBOARD;
+            keys[count].ki.wScan = *text++;
+            keys[count].ki.dwFlags = KEYEVENTF_UNICODE;
+            keys[count + 1] = keys[count];
+            keys[count + 1].ki.dwFlags |= KEYEVENTF_KEYUP;
+            count += 2;
+        }
+        send_inputs(keys, count);
+    }
 }
 
 static void send_modified_press(WORD mod1, WORD mod2, WORD vk) {
-    INPUT keys[2];
-    if (mod1) {
-        keys[0] = make_key(mod1, 0);
-        send_inputs(keys, 1);
-    }
-    if (mod2) {
-        keys[0] = make_key(mod2, 0);
-        send_inputs(keys, 1);
-    }
-    keys[0] = make_key(vk, 0);
-    keys[1] = make_key(vk, KEYEVENTF_KEYUP);
-    send_inputs(keys, 2);
-    if (mod2) {
-        keys[0] = make_key(mod2, KEYEVENTF_KEYUP);
-        send_inputs(keys, 1);
-    }
-    if (mod1) {
-        keys[0] = make_key(mod1, KEYEVENTF_KEYUP);
-        send_inputs(keys, 1);
-    }
+    INPUT keys[6];
+    UINT count = 0;
+    if (mod1) keys[count++] = make_key(mod1, 0);
+    if (mod2) keys[count++] = make_key(mod2, 0);
+    keys[count++] = make_key(vk, 0);
+    keys[count++] = make_key(vk, KEYEVENTF_KEYUP);
+    if (mod2) keys[count++] = make_key(mod2, KEYEVENTF_KEYUP);
+    if (mod1) keys[count++] = make_key(mod1, KEYEVENTF_KEYUP);
+    send_inputs(keys, count);
 }
 
 static BOOL get_clipboard_text_dup(wchar_t **out_text) {
@@ -1340,26 +1353,25 @@ static BOOL drag_horizontal_scrollbar_to_right(HWND hwnd) {
 static BOOL create_tall_fixture(wchar_t *path, size_t path_count) {
     wchar_t temp_dir[MAX_PATH];
     HANDLE file;
-    char line[64];
-    DWORD written;
-
-    if (!GetTempPathW((DWORD)COUNT_OF(temp_dir), temp_dir)) return FALSE;
+    char buffer[65536];
+    DWORD used = 0, written;
+    if (path_count < MAX_PATH || !GetTempPathW(COUNT_OF(temp_dir), temp_dir)) return FALSE;
     if (!GetTempFileNameW(temp_dir, L"txt", 0, path)) return FALSE;
-
     file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) return FALSE;
-
+    if (file == INVALID_HANDLE_VALUE) { DeleteFileW(path); return FALSE; }
     for (int i = 0; i < 25000; ++i) {
-        int len = snprintf(line, sizeof(line), "line %05d abcdefghijklmnopqrstuvwxyz\r\n", i);
-        if (!WriteFile(file, line, (DWORD)len, &written, NULL) || written != (DWORD)len) {
-            CloseHandle(file);
-            return FALSE;
+        if (sizeof(buffer) - used < 64) {
+            if (!WriteFile(file, buffer, used, &written, NULL) || written != used) goto fail;
+            used = 0;
         }
+        used += snprintf(buffer + used, sizeof(buffer) - used,
+                         "line %05d abcdefghijklmnopqrstuvwxyz\r\n", i);
     }
-
+    if (used && (!WriteFile(file, buffer, used, &written, NULL) || written != used)) goto fail;
     CloseHandle(file);
-    (void)path_count;
     return TRUE;
+fail:
+    CloseHandle(file); DeleteFileW(path); return FALSE;
 }
 
 static BOOL create_text_fixture(wchar_t *path, size_t path_count, const char *utf8) {
@@ -1535,17 +1547,6 @@ static BOOL load_focus_selectissue(TestApp *app, wchar_t *fixture, size_t fixtur
     return TRUE;
 }
 
-static BOOL test_selectissue_md_loads(void) {
-    const char *test_name = "selectissue_md_loads";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-
-    if (!load_focus_selectissue(&app, fixture, COUNT_OF(fixture), test_name)) return FALSE;
-
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
 
 static BOOL test_loaded_tab_mouse_backspace_deletes_only_indent(void) {
     const char *test_name = "loaded_tab_mouse_backspace_deletes_only_indent";
@@ -1714,18 +1715,6 @@ static BOOL test_loaded_tab_mouse_drag_selects_rendered_text(void) {
     return TRUE;
 }
 
-static BOOL test_launches_new_window_class(void) {
-    const char *test_name = "launches_new_window_class";
-    TestApp app;
-
-    if (!launch_app(&app)) {
-        fail_message(test_name, "could not launch app");
-        return FALSE;
-    }
-
-    close_app(&app);
-    return TRUE;
-}
 
 static BOOL test_ctrl_n_opens_fresh_new_window(void) {
     const char *test_name = "ctrl_n_opens_fresh_new_window";
@@ -1765,28 +1754,9 @@ static BOOL test_ctrl_n_opens_fresh_new_window(void) {
     return TRUE;
 }
 
-static BOOL test_vertical_scrollbar_scrollable_for_tall_file(void) {
-    const char *test_name = "vertical_scrollbar_scrollable_for_tall_file";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-    SCROLLINFO si;
 
-    if (!launch_with_tall_fixture(&app, fixture, COUNT_OF(fixture), test_name)) return FALSE;
-
-    if (!get_vscroll(app.window, &si) || scroll_max_pos(&si) <= si.nMin) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "vertical scrollbar was not scrollable");
-        return FALSE;
-    }
-
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
-
-static BOOL test_vertical_scrollbar_release_at_end_is_100_percent(void) {
-    const char *test_name = "vertical_scrollbar_release_at_end_is_100_percent";
+static BOOL test_vertical_scrollbar_bottom_and_release(void) {
+    const char *test_name = "vertical_scrollbar_bottom_and_release";
     wchar_t fixture[MAX_PATH];
     TestApp app;
     ScrollWait wait;
@@ -1823,6 +1793,23 @@ static BOOL test_vertical_scrollbar_release_at_end_is_100_percent(void) {
         fail_message(test_name, message);
         return FALSE;
     }
+
+    if (!drag_vertical_scrollbar_fraction(app.window, 0.60)) {
+        close_app(&app);
+        DeleteFileW(fixture);
+        fail_message(test_name, "could not drag vertical scrollbar up from bottom");
+        return FALSE;
+    }
+
+    ZeroMemory(&wait, sizeof(wait));
+    wait.hwnd = app.window;
+    if (!wait_until_true(TEST_UI_TIMEOUT_MS, vscroll_not_at_end, &wait)) {
+        close_app(&app);
+        DeleteFileW(fixture);
+        fail_message(test_name, "dragging up from bottom left scrollbar pinned at end");
+        return FALSE;
+    }
+
 
     close_app(&app);
     DeleteFileW(fixture);
@@ -2702,49 +2689,6 @@ static BOOL test_maximized_paradym_top_wheel_moves_immediately(void) {
     return TRUE;
 }
 
-static BOOL test_vertical_scrollbar_drag_up_from_bottom_releases_stickiness(void) {
-    const char *test_name = "vertical_scrollbar_drag_up_from_bottom_releases_stickiness";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-    ScrollWait wait;
-
-    if (!launch_with_tall_fixture(&app, fixture, COUNT_OF(fixture), test_name)) return FALSE;
-    if (!drag_vertical_scrollbar_to_bottom(app.window)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not drag vertical scrollbar to bottom");
-        return FALSE;
-    }
-
-    ZeroMemory(&wait, sizeof(wait));
-    wait.hwnd = app.window;
-    if (!wait_until_true(TEST_UI_TIMEOUT_MS, vscroll_is_at_end, &wait)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not reach end before drag-up check");
-        return FALSE;
-    }
-
-    if (!drag_vertical_scrollbar_fraction(app.window, 0.60)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not drag vertical scrollbar up from bottom");
-        return FALSE;
-    }
-
-    ZeroMemory(&wait, sizeof(wait));
-    wait.hwnd = app.window;
-    if (!wait_until_true(TEST_UI_TIMEOUT_MS, vscroll_not_at_end, &wait)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "dragging up from bottom left scrollbar pinned at end");
-        return FALSE;
-    }
-
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
 
 static BOOL test_horizontal_scrollbar_track_click_moves_right(void) {
     const char *test_name = "horizontal_scrollbar_track_click_moves_right";
@@ -3094,7 +3038,7 @@ static BOOL test_tab_inserts_two_spaces(void) {
     wchar_t fixture[MAX_PATH];
     TestApp app;
 
-    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "abcd\r\n")) return FALSE;
+    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "")) return FALSE;
     if (!focus_app_window(app.window)) {
         close_app(&app);
         DeleteFileW(fixture);
@@ -3117,8 +3061,8 @@ static BOOL test_tab_inserts_two_spaces(void) {
     return TRUE;
 }
 
-static BOOL test_tab_mid_word_inserts_two_spaces_at_caret(void) {
-    const char *test_name = "tab_mid_word_inserts_two_spaces_at_caret";
+static BOOL test_tab_mid_word_roundtrip_and_caret(void) {
+    const char *test_name = "tab_mid_word_roundtrip_and_caret";
     wchar_t fixture[MAX_PATH];
     TestApp app;
     POINT before = {0};
@@ -3129,15 +3073,6 @@ static BOOL test_tab_mid_word_inserts_two_spaces_at_caret(void) {
         close_app(&app);
         DeleteFileW(fixture);
         fail_message(test_name, "could not focus app window");
-        return FALSE;
-    }
-
-    if (!wait_for_window_text(app.window,
-        L"alpha beta gamma delta\r\nshort\r\n    indented line with several words and punctuation, to stress line selection.\r\ntiny\r\nthis is a much longer line than the others and it should stay selectable as a whole line.\r\nmid\r\nlast line with spaces at the end    \r\n")) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_text_mismatch(test_name, app.window,
-            L"alpha beta gamma delta\r\nshort\r\n    indented line with several words and punctuation, to stress line selection.\r\ntiny\r\nthis is a much longer line than the others and it should stay selectable as a whole line.\r\nmid\r\nlast line with spaces at the end    \r\n");
         return FALSE;
     }
 
@@ -3176,6 +3111,15 @@ static BOOL test_tab_mid_word_inserts_two_spaces_at_caret(void) {
         return FALSE;
     }
 
+    send_modified_press(VK_SHIFT, 0, VK_TAB);
+    if (!wait_for_window_text(app.window, L"abcd\r\n")) {
+        fail_text_mismatch(test_name, app.window, L"abcd\r\n");
+        close_app(&app);
+        DeleteFileW(fixture);
+        return FALSE;
+    }
+
+
     close_app(&app);
     DeleteFileW(fixture);
     return TRUE;
@@ -3186,7 +3130,7 @@ static BOOL test_tab_with_single_line_selection_indents_selection_start(void) {
     wchar_t fixture[MAX_PATH];
     TestApp app;
 
-    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "")) return FALSE;
+    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "abcd\r\n")) return FALSE;
     if (!focus_app_window(app.window)) {
         close_app(&app);
         DeleteFileW(fixture);
@@ -3242,8 +3186,8 @@ static BOOL test_tab_with_multiline_selection_indents_each_selected_line(void) {
     return TRUE;
 }
 
-static BOOL test_shift_tab_unindents_selected_lines_by_up_to_two_spaces(void) {
-    const char *test_name = "shift_tab_unindents_selected_lines_by_up_to_two_spaces";
+static BOOL test_shift_tab_selection_unindent_and_noop(void) {
+    const char *test_name = "shift_tab_selection_unindent_and_noop";
     wchar_t fixture[MAX_PATH];
     TestApp app;
 
@@ -3266,25 +3210,7 @@ static BOOL test_shift_tab_unindents_selected_lines_by_up_to_two_spaces(void) {
         return FALSE;
     }
 
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
-
-static BOOL test_shift_tab_noop_when_selected_lines_have_no_leading_spaces(void) {
-    const char *test_name = "shift_tab_noop_when_selected_lines_have_no_leading_spaces";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-
-    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "one\r\ntwo\r\nthree\r\n")) return FALSE;
-    if (!focus_app_window(app.window)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not focus app window");
-        return FALSE;
-    }
-
-    send_key_press(VK_HOME);
+    send_modified_press(VK_CONTROL, 0, VK_HOME);
     send_modified_press(VK_SHIFT, 0, VK_DOWN);
     send_modified_press(VK_SHIFT, 0, VK_DOWN);
     send_modified_press(VK_SHIFT, 0, VK_TAB);
@@ -3295,53 +3221,13 @@ static BOOL test_shift_tab_noop_when_selected_lines_have_no_leading_spaces(void)
         return FALSE;
     }
 
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
-
-static BOOL test_shift_tab_after_tab_reverts_caret_only_indent(void) {
-    const char *test_name = "shift_tab_after_tab_reverts_caret_only_indent";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-
-    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "abcd\r\n")) return FALSE;
-    if (!focus_app_window(app.window)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not focus app window");
-        return FALSE;
-    }
-
-    if (!wait_for_window_text(app.window, L"abcd\r\n")) {
-        fail_text_mismatch(test_name, app.window, L"abcd\r\n");
-        close_app(&app);
-        DeleteFileW(fixture);
-        return FALSE;
-    }
-    send_key_press(VK_HOME);
-    send_key_press(VK_RIGHT);
-    send_key_press(VK_RIGHT);
-    send_key_press(VK_TAB);
-    if (!wait_for_window_text(app.window, L"ab  cd\r\n")) {
-        fail_text_mismatch(test_name, app.window, L"ab  cd\r\n");
-        close_app(&app);
-        DeleteFileW(fixture);
-        return FALSE;
-    }
-
-    send_modified_press(VK_SHIFT, 0, VK_TAB);
-    if (!wait_for_window_text(app.window, L"abcd\r\n")) {
-        fail_text_mismatch(test_name, app.window, L"abcd\r\n");
-        close_app(&app);
-        DeleteFileW(fixture);
-        return FALSE;
-    }
 
     close_app(&app);
     DeleteFileW(fixture);
     return TRUE;
 }
+
+
 
 static BOOL test_shift_tab_caret_line_unindents_by_two_spaces_per_press(void) {
     const char *test_name = "shift_tab_caret_line_unindents_by_two_spaces_per_press";
@@ -3599,7 +3485,7 @@ static BOOL test_undo_redo_cut_paste_sequence(void) {
 }
 
 static BOOL test_shift_multiline_select_copy(void) {
-    const char *test_name = "shift_multiline_select_delete";
+    const char *test_name = "multiline_delete_backspace_and_undo";
     wchar_t fixture[MAX_PATH];
     TestApp app;
 
@@ -3628,39 +3514,18 @@ static BOOL test_shift_multiline_select_copy(void) {
         return FALSE;
     }
 
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
-
-static BOOL test_shift_multiline_replace_typing(void) {
-    const char *test_name = "shift_multiline_replace_typing";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-
-    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "one\r\ntwo\r\nthree\r\n")) return FALSE;
-    if (!focus_app_window(app.window)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not focus app window");
-        return FALSE;
-    }
-    if (!window_text_equals(app.window, L"one\r\ntwo\r\nthree\r\n")) {
-        close_app(&app);
-        DeleteFileW(fixture);
+    send_modified_press(VK_CONTROL, 0, 'Z');
+    if (!wait_for_window_text(app.window, L"one\r\ntwo\r\nthree\r\n")) {
         fail_text_mismatch(test_name, app.window, L"one\r\ntwo\r\nthree\r\n");
-        return FALSE;
+        close_app(&app); DeleteFileW(fixture); return FALSE;
     }
-
-    send_key_press(VK_HOME);
+    send_modified_press(VK_CONTROL, 0, VK_HOME);
     send_modified_press(VK_SHIFT, 0, VK_DOWN);
     send_modified_press(VK_SHIFT, 0, VK_DOWN);
     send_key_press(VK_BACK);
-    if (!window_text_equals(app.window, L"three\r\n")) {
-        close_app(&app);
-        DeleteFileW(fixture);
+    if (!wait_for_window_text(app.window, L"three\r\n")) {
         fail_text_mismatch(test_name, app.window, L"three\r\n");
-        return FALSE;
+        close_app(&app); DeleteFileW(fixture); return FALSE;
     }
 
     close_app(&app);
@@ -3668,8 +3533,9 @@ static BOOL test_shift_multiline_replace_typing(void) {
     return TRUE;
 }
 
-static BOOL test_shift_up_on_first_row_selects_to_start(void) {
-    const char *test_name = "shift_up_on_first_row_selects_to_start";
+
+static BOOL test_shift_selection_at_document_edges(void) {
+    const char *test_name = "shift_selection_at_document_edges";
     wchar_t fixture[MAX_PATH];
     TestApp app;
 
@@ -3695,26 +3561,8 @@ static BOOL test_shift_up_on_first_row_selects_to_start(void) {
         return FALSE;
     }
 
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
-
-static BOOL test_shift_down_on_final_row_selects_to_end(void) {
-    const char *test_name = "shift_down_on_final_row_selects_to_end";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-
-    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, "alpha\r\nbeta")) return FALSE;
-    if (!focus_app_window(app.window)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not focus app window");
-        return FALSE;
-    }
-
     clear_clipboard();
-    send_key_press(VK_HOME);
+    send_modified_press(VK_CONTROL, 0, VK_HOME);
     send_key_press(VK_DOWN);
     send_key_press(VK_RIGHT);
     send_modified_press(VK_SHIFT, 0, VK_DOWN);
@@ -3726,10 +3574,12 @@ static BOOL test_shift_down_on_final_row_selects_to_end(void) {
         return FALSE;
     }
 
+
     close_app(&app);
     DeleteFileW(fixture);
     return TRUE;
 }
+
 
 static BOOL test_alt_shift_down_insert_column(void) {
     const char *test_name = "alt_shift_down_insert_column";
@@ -5499,8 +5349,8 @@ static BOOL test_ctrl_x_no_selection_line_cut_paste(void) {
     return TRUE;
 }
 
-static BOOL test_selectissue_md_line10_copy(void) {
-    const char *test_name = "selectissue_md_line10_copy";
+static BOOL test_selectissue_line_copy_with_and_without_newline(void) {
+    const char *test_name = "selectissue_line_copy_with_and_without_newline";
     wchar_t fixture[MAX_PATH];
     TestApp app;
 
@@ -5524,26 +5374,8 @@ static BOOL test_selectissue_md_line10_copy(void) {
         return FALSE;
     }
 
-    close_app(&app);
-    DeleteFileW(fixture);
-    return TRUE;
-}
-
-static BOOL test_selectissue_md_line10_shift_down_copy(void) {
-    const char *test_name = "selectissue_md_line10_shift_down_copy";
-    wchar_t fixture[MAX_PATH];
-    TestApp app;
-
-    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), test_name, g_selectissue_code_text)) return FALSE;
-    if (!focus_app_window(app.window)) {
-        close_app(&app);
-        DeleteFileW(fixture);
-        fail_message(test_name, "could not focus app window");
-        return FALSE;
-    }
-
     clear_clipboard();
-    send_key_press(VK_HOME);
+    send_modified_press(VK_CONTROL, 0, VK_HOME);
     for (int i = 0; i < 9; ++i) send_key_press(VK_DOWN);
     send_modified_press(VK_SHIFT, 0, VK_DOWN);
     send_modified_press(VK_CONTROL, 0, 'C');
@@ -5554,10 +5386,12 @@ static BOOL test_selectissue_md_line10_shift_down_copy(void) {
         return FALSE;
     }
 
+
     close_app(&app);
     DeleteFileW(fixture);
     return TRUE;
 }
+
 
 static BOOL test_selectissue_md_select_lines_backspace(void) {
     const char *test_name = "selectissue_md_select_lines_backspace";
@@ -7158,12 +6992,153 @@ static BOOL test_save_mapped_file_leaves_no_replacement_temp(void) {
     return TRUE;
 }
 
+static BOOL check_text(TestApp *app, const wchar_t *expected, const char *stage) {
+    if (wait_for_window_text(app->window, expected)) {
+        return TRUE;
+    }
+    fail_text_mismatch(stage, app->window, expected);
+    return FALSE;
+}
+
+static int check_unicode_scalars(void) {
+    const wchar_t *chars[] = {L"\x00e9", L"\x20ac", L"\xd83d\xde00"};
+    const char *utf8[] = {"\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80"};
+    int failed = 0;
+    for (int scalar = 0; scalar < 3; ++scalar) for (int mode = 0; mode < 3; ++mode) {
+        TestApp app;
+        wchar_t fixture[MAX_PATH], original[16], inserted[16], deleted[16];
+        char file_text[20];
+        wcscpy(original, L"L"); wcscat(original, chars[scalar]); wcscat(original, L"R");
+        wcscpy(inserted, L"LX"); wcscat(inserted, chars[scalar]); wcscat(inserted, L"R");
+        wcscpy(deleted, L"L"); wcscat(deleted, chars[scalar]);
+        strcpy(file_text, "L"); strcat(file_text, utf8[scalar]); strcat(file_text, "R");
+        if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), "unicode_scalar", mode == 0 ? file_text : "")) return 1;
+        if (!focus_app_window(app.window)) { close_app(&app); DeleteFileW(fixture); return 1; }
+        if (mode == 1) { set_clipboard_text(original); send_modified_press(VK_CONTROL, 0, 'V'); }
+        if (mode == 2) send_unicode_string(original);
+        printf("Unicode scalar=%d backing=%d\n", scalar, mode);
+        failed += !check_text(&app, original, "original");
+        send_modified_press(VK_CONTROL, 0, VK_END);
+        send_key_press(VK_LEFT); send_key_press(VK_LEFT);
+        set_clipboard_text(L"X"); send_modified_press(VK_CONTROL, 0, 'V');
+        failed += !check_text(&app, inserted, "Left and paste at scalar boundary");
+        send_modified_press(VK_CONTROL, 0, 'Z');
+        failed += !check_text(&app, original, "undo paste");
+        send_key_press(VK_DELETE);
+        failed += !check_text(&app, L"LR", "Delete removes complete scalar");
+        send_modified_press(VK_CONTROL, 0, 'Z');
+        send_key_press(VK_RIGHT); send_key_press(VK_DELETE);
+        failed += !check_text(&app, deleted, "Right skips complete scalar");
+        send_key_press(VK_BACK);
+        failed += !check_text(&app, L"L", "Backspace removes complete scalar");
+        send_modified_press(VK_CONTROL, 0, 'Z');
+        send_modified_press(VK_SHIFT, 0, VK_LEFT);
+        send_modified_press(VK_CONTROL, 0, 'C');
+        if (!wait_for_clipboard_text(chars[scalar])) { fail_clipboard_mismatch("Unicode selection copy", chars[scalar]); failed++; }
+        set_clipboard_text(L"Q"); send_modified_press(VK_CONTROL, 0, 'V');
+        failed += !check_text(&app, L"LQ", "replace selected scalar");
+        send_modified_press(VK_CONTROL, 0, 'Z');
+        failed += !check_text(&app, deleted, "undo replacement");
+        send_modified_press(VK_CONTROL, 0, 'Y');
+        failed += !check_text(&app, L"LQ", "redo replacement");
+        send_modified_press(VK_CONTROL, 0, 'Z');
+        send_modified_press(VK_CONTROL, 0, 'S');
+        file_text[strlen(file_text) - 1] = 0;
+        if (!wait_for_file_text(fixture, file_text)) { failed++; printf("FAIL Unicode saved bytes\n"); }
+        close_app(&app); DeleteFileW(fixture);
+    }
+    return failed;
+}
+
+static int check_unicode_columns(void) {
+    TestApp app;
+    wchar_t fixture[MAX_PATH];
+    POINT start, next, click;
+    int failed = 0;
+    if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), "unicode_columns", "a\xc3\xa9z\r\nb\xe2\x82\xacz")) return 1;
+    if (!focus_app_window(app.window)) { close_app(&app); DeleteFileW(fixture); return 1; }
+    send_modified_press(VK_CONTROL, 0, VK_HOME);
+    if (!get_caret_screen_pos(app.window, &start)) { close_app(&app); DeleteFileW(fixture); return 1; }
+    send_key_press(VK_RIGHT);
+    if (!get_caret_screen_pos(app.window, &next)) { close_app(&app); DeleteFileW(fixture); return 1; }
+    click.x = start.x + 2 * (next.x - start.x); click.y = start.y + 4;
+    ScreenToClient(app.window, &click);
+    click_client(app.window, click.x, click.y, FALSE);
+    send_unicode_string(L"X");
+    failed += !check_text(&app, L"a\x00e9Xz\r\nb\x20acz", "mouse column after multibyte scalar");
+    send_modified_press(VK_CONTROL, 0, 'Z');
+    send_modified_press(VK_CONTROL, 0, VK_HOME);
+    send_key_press(VK_RIGHT); send_key_press(VK_RIGHT); send_key_press(VK_DOWN);
+    send_unicode_string(L"X");
+    failed += !check_text(&app, L"a\x00e9z\r\nb\x20acXz", "vertical movement uses character columns");
+    send_modified_press(VK_CONTROL, 0, 'Z');
+    send_modified_press(VK_CONTROL, 0, VK_HOME);
+    send_key_press(VK_RIGHT);
+    send_modified_press(VK_MENU, VK_SHIFT, VK_DOWN);
+    send_modified_press(VK_MENU, VK_SHIFT, VK_RIGHT);
+    set_clipboard_text(L"\x00f1"); send_modified_press(VK_CONTROL, 0, 'V');
+    failed += !check_text(&app, L"a\x00f1z\r\nb\x00f1z", "box paste replaces whole scalars");
+    send_unicode_string(L"X");
+    failed += !check_text(&app, L"a\x00f1Xz\r\nb\x00f1Xz", "box caret advances one column after Unicode paste");
+    close_app(&app); DeleteFileW(fixture);
+    return failed;
+}
+
+static int check_paste_boundaries(void) {
+    const int sizes[] = {1, 65535, 65536, 65537, 131072};
+    for (int mode = 0; mode < 2; ++mode) {
+        TestApp app;
+        wchar_t fixture[MAX_PATH];
+        if (!launch_with_text_fixture(&app, fixture, COUNT_OF(fixture), "paste_boundaries",
+                                      mode ? "" : "LEFT|RIGHT")) return 1;
+        if (!focus_app_window(app.window)) { close_app(&app); DeleteFileW(fixture); return 1; }
+        if (mode) send_unicode_string(L"LEFT|RIGHT");
+        send_modified_press(VK_CONTROL, 0, VK_HOME);
+        for (int i = 0; i < 5; ++i) send_key_press(VK_RIGHT);
+        for (unsigned n = 0; n < COUNT_OF(sizes); ++n) {
+            int size = sizes[n];
+            BOOL ok = FALSE;
+            wchar_t *payload = calloc(size + 1, sizeof(wchar_t));
+            wchar_t *expected = calloc(size + 11, sizeof(wchar_t));
+            if (payload && expected) {
+                for (int i = 0; i < size; ++i) payload[i] = L'a' + i % 26;
+                wcscpy(expected, L"LEFT|"); wcscat(expected, payload); wcscat(expected, L"RIGHT");
+                printf("  paste backing=%s bytes=%d\n", mode ? "typed" : "mapped", size);
+                if (set_clipboard_text(payload)) {
+                    send_modified_press(VK_CONTROL, 0, 'V');
+                    ok = check_text(&app, expected, "paste");
+                    if (ok) {
+                        send_modified_press(VK_CONTROL, 0, 'Z');
+                        ok = check_text(&app, L"LEFT|RIGHT", "undo");
+                    }
+                    if (ok) {
+                        send_modified_press(VK_CONTROL, 0, 'Y');
+                        ok = check_text(&app, expected, "redo");
+                    }
+                    if (ok) {
+                        send_modified_press(VK_CONTROL, 0, 'Z');
+                        ok = check_text(&app, L"LEFT|RIGHT", "restore for next boundary");
+                    }
+                }
+            }
+            free(payload); free(expected);
+            if (!ok) { close_app(&app); DeleteFileW(fixture); return 1; }
+        }
+        close_app(&app); DeleteFileW(fixture);
+    }
+    return 0;
+}
+
+static BOOL test_unicode_scalars(void) { return check_unicode_scalars() == 0; }
+static BOOL test_unicode_columns(void) { return check_unicode_columns() == 0; }
+static BOOL test_paste_boundaries(void) { return check_paste_boundaries() == 0; }
+
 static TestCase g_tests[] = {
-    {"launches_new_window_class", test_launches_new_window_class},
+    {"unicode_scalars", test_unicode_scalars},
+    {"unicode_columns", test_unicode_columns},
+    {"paste_boundaries", test_paste_boundaries},
     {"ctrl_n_opens_fresh_new_window", test_ctrl_n_opens_fresh_new_window},
-    {"vertical_scrollbar_scrollable_for_tall_file", test_vertical_scrollbar_scrollable_for_tall_file},
-    {"vertical_scrollbar_release_at_end_is_100_percent", test_vertical_scrollbar_release_at_end_is_100_percent},
-    {"vertical_scrollbar_drag_up_from_bottom_releases_stickiness", test_vertical_scrollbar_drag_up_from_bottom_releases_stickiness},
+    {"vertical_scrollbar_bottom_and_release", test_vertical_scrollbar_bottom_and_release},
     {"pagedown_moves_vertical_scroll", test_pagedown_moves_vertical_scroll},
     {"mousewheel_down_then_up_restores_scroll", test_mousewheel_down_then_up_restores_scroll},
     {"mousewheel_scroll_keeps_caret_document_location", test_mousewheel_scroll_keeps_caret_document_location},
@@ -7184,22 +7159,18 @@ static TestCase g_tests[] = {
     {"ctrl_right_symbols_are_separate_jumps", test_ctrl_right_symbols_are_separate_jumps},
     {"basic_text_regressions", test_basic_text_regressions},
     {"tab_inserts_two_spaces", test_tab_inserts_two_spaces},
-    {"tab_mid_word_inserts_two_spaces_at_caret", test_tab_mid_word_inserts_two_spaces_at_caret},
+    {"tab_mid_word_roundtrip_and_caret", test_tab_mid_word_roundtrip_and_caret},
     {"tab_with_single_line_selection_indents_selection_start", test_tab_with_single_line_selection_indents_selection_start},
     {"tab_with_multiline_selection_indents_each_selected_line", test_tab_with_multiline_selection_indents_each_selected_line},
-    {"shift_tab_unindents_selected_lines_by_up_to_two_spaces", test_shift_tab_unindents_selected_lines_by_up_to_two_spaces},
-    {"shift_tab_noop_when_selected_lines_have_no_leading_spaces", test_shift_tab_noop_when_selected_lines_have_no_leading_spaces},
-    {"shift_tab_after_tab_reverts_caret_only_indent", test_shift_tab_after_tab_reverts_caret_only_indent},
+    {"shift_tab_selection_unindent_and_noop", test_shift_tab_selection_unindent_and_noop},
     {"shift_tab_caret_line_unindents_by_two_spaces_per_press", test_shift_tab_caret_line_unindents_by_two_spaces_per_press},
     {"tab_multiline_selection_excludes_line_when_ending_at_its_start", test_tab_multiline_selection_excludes_line_when_ending_at_its_start},
     {"ctrl_backspace_deletes_previous_word", test_ctrl_backspace_deletes_previous_word},
     {"ctrl_delete_deletes_next_word", test_ctrl_delete_deletes_next_word},
     {"undo_redo_basic_edit_sequence", test_undo_redo_basic_edit_sequence},
     {"undo_redo_cut_paste_sequence", test_undo_redo_cut_paste_sequence},
-    {"shift_multiline_select_delete", test_shift_multiline_select_copy},
-    {"shift_multiline_replace_typing", test_shift_multiline_replace_typing},
-    {"shift_up_on_first_row_selects_to_start", test_shift_up_on_first_row_selects_to_start},
-    {"shift_down_on_final_row_selects_to_end", test_shift_down_on_final_row_selects_to_end},
+    {"multiline_delete_backspace_and_undo", test_shift_multiline_select_copy},
+    {"shift_selection_at_document_edges", test_shift_selection_at_document_edges},
     {"alt_shift_down_insert_column", test_alt_shift_down_insert_column},
     {"alt_down_swaps_line_with_trailing_empty_final_line", test_alt_down_swaps_line_with_trailing_empty_final_line},
     {"alt_up_from_empty_last_line_swaps_with_previous_line", test_alt_up_from_empty_last_line_swaps_with_previous_line},
@@ -7238,11 +7209,9 @@ static TestCase g_tests[] = {
     {"ctrl_c_no_selection_line_copy_paste", test_ctrl_c_no_selection_line_copy_paste},
     {"ctrl_c_no_selection_single_line_copy_paste", test_ctrl_c_no_selection_single_line_copy_paste},
     {"ctrl_x_no_selection_line_cut_paste", test_ctrl_x_no_selection_line_cut_paste},
-    {"selectissue_md_loads", test_selectissue_md_loads},
     {"loaded_tab_mouse_backspace_deletes_only_indent", test_loaded_tab_mouse_backspace_deletes_only_indent},
     {"loaded_tab_mouse_drag_selects_rendered_text", test_loaded_tab_mouse_drag_selects_rendered_text},
-    {"selectissue_md_line10_copy", test_selectissue_md_line10_copy},
-    {"selectissue_md_line10_shift_down_copy", test_selectissue_md_line10_shift_down_copy},
+    {"selectissue_line_copy_with_and_without_newline", test_selectissue_line_copy_with_and_without_newline},
     {"selectissue_md_select_lines_backspace", test_selectissue_md_select_lines_backspace},
     {"paste_selectissue_text_then_backspace_lines", test_paste_selectissue_text_then_backspace_lines},
     {"type_selectissue_text_then_backspace_lines", test_type_selectissue_text_then_backspace_lines},
@@ -7279,63 +7248,62 @@ static TestCase g_tests[] = {
     {"save_mapped_file_leaves_no_replacement_temp", test_save_mapped_file_leaves_no_replacement_temp},
 };
 
-static BOOL should_run_test(const TestCase *test, int argc, wchar_t **argv) {
-    if (argc <= 2) {
-        return strcmp(test->name, "launches_new_window_class") == 0 ||
-               strcmp(test->name, "basic_text_regressions") == 0;
-    }
-    for (int i = 2; i < argc; ++i) {
-        wchar_t wide_name[128];
-        size_t j;
-
-        for (j = 0; test->name[j] && j + 1 < COUNT_OF(wide_name); ++j) {
-            wide_name[j] = (wchar_t)(unsigned char)test->name[j];
-        }
-        wide_name[j] = 0;
-        if (wcscmp(argv[i], wide_name) == 0) return TRUE;
-    }
-    return FALSE;
+static BOOL is_smoke(const TestCase *test) {
+    return strcmp(test->name, "basic_text_regressions") == 0 ||
+           strcmp(test->name, "undo_redo_cut_paste_sequence") == 0 ||
+           strcmp(test->name, "mouse_drag_selection_copy") == 0;
 }
-
-int wmain(int argc, wchar_t **argv) {
-    size_t selected = 0;
-    size_t count = sizeof(g_tests) / sizeof(g_tests[0]);
-
-    if (argc > 1 && argv[1] && argv[1][0]) {
-        wcsncpy(g_exe_path, argv[1], COUNT_OF(g_exe_path) - 1);
-        g_exe_path[COUNT_OF(g_exe_path) - 1] = 0;
-    } else {
-        wcsncpy(g_exe_path, L"text.exe", COUNT_OF(g_exe_path) - 1);
-    }
-    {
-        DWORD env_len = GetEnvironmentVariableW(L"TEXT_LOOK_DIR", g_look_dir, (DWORD)COUNT_OF(g_look_dir));
-        if (env_len == 0 || env_len >= COUNT_OF(g_look_dir)) {
-            g_look_dir[0] = 0;
+static BOOL should_run_test(const TestCase *test, int argc, wchar_t **argv) {
+    BOOL pedantic = FALSE, named = FALSE, matched = FALSE;
+    wchar_t wide[128];
+    size_t j;
+    for (j = 0; test->name[j] && j + 1 < COUNT_OF(wide); ++j) wide[j] = test->name[j];
+    wide[j] = 0;
+    for (int i = 2; i < argc; ++i) {
+        if (!wcscmp(argv[i], L"--pedantic")) pedantic = TRUE;
+        else if (wcscmp(argv[i], L"--list")) {
+            named = TRUE;
+            if (!wcscmp(argv[i], wide)) matched = TRUE;
         }
     }
-
-    for (size_t i = 0; i < count; ++i) {
-        if (should_run_test(&g_tests[i], argc, argv)) ++selected;
+    return named ? matched : (pedantic ? !is_smoke(test) : is_smoke(test));
+}
+int wmain(int argc, wchar_t **argv) {
+    size_t selected = 0, count = COUNT_OF(g_tests);
+    BOOL list = FALSE;
+    double total = (double)monotonic_tick_ms();
+    wcsncpy(g_exe_path, argc > 1 ? argv[1] : L"text.exe", COUNT_OF(g_exe_path) - 1);
+    for (int arg = 2; arg < argc; ++arg) {
+        BOOL known = !wcscmp(argv[arg], L"--pedantic") || !wcscmp(argv[arg], L"--list");
+        if (!wcscmp(argv[arg], L"--list")) list = TRUE;
+        for (size_t i = 0; !known && i < count; ++i) {
+            wchar_t wide[128]; size_t j;
+            for (j = 0; g_tests[i].name[j] && j + 1 < COUNT_OF(wide); ++j) wide[j] = g_tests[i].name[j];
+            wide[j] = 0;
+            if (!wcscmp(argv[arg], wide)) known = TRUE;
+        }
+        if (!known) { fwprintf(stderr, L"Unknown test or option: %ls\n", argv[arg]); return 2; }
     }
-
-    printf("running %zu black-box tests\n", selected);
+    DWORD env_len = GetEnvironmentVariableW(L"TEXT_LOOK_DIR", g_look_dir, COUNT_OF(g_look_dir));
+    if (!env_len || env_len >= COUNT_OF(g_look_dir)) g_look_dir[0] = 0;
     for (size_t i = 0; i < count; ++i) {
-        BOOL ok;
-        ULONGLONG started;
-        double elapsed_ms;
-
         if (!should_run_test(&g_tests[i], argc, argv)) continue;
-        started = monotonic_tick_ms();
-        ok = g_tests[i].fn();
-        elapsed_ms = (double)(monotonic_tick_ms() - started);
-        if (ok) printf("\nPASS %s (%.0f ms)\n", g_tests[i].name, elapsed_ms);
+        ++selected;
+        if (list) { puts(g_tests[i].name); continue; }
+        int before = g_failures;
+        g_input_ms = g_wait_ms = g_launch_ms = 0;
+        ULONGLONG started = monotonic_tick_ms();
+        printf("RUN %s\n", g_tests[i].name); fflush(stdout);
+        BOOL ok = g_tests[i].fn();
+        if (!ok && g_failures == before) fail_message(g_tests[i].name, "test returned failure");
+        printf("%s %s (%.0f ms)\n", ok && before == g_failures ? "PASS" : "FAIL",
+               g_tests[i].name, (double)(monotonic_tick_ms() - started));
+        printf("  phases: input=%llu ms, condition waits=%llu ms, launch=%llu ms (waits may overlap launch)\n",
+               g_input_ms, g_wait_ms, g_launch_ms);
+        fflush(stdout);
     }
-
-    if (g_failures) {
-        printf("%d test(s) failed\n", g_failures);
-        return 1;
-    }
-
-    printf("all tests passed\n");
-    return 0;
+    if (!selected) { fprintf(stderr, "No tests selected\n"); return 2; }
+    if (!list) printf("%zu tests, %d failures (%.0f ms total)\n", selected, g_failures,
+                      (double)monotonic_tick_ms() - total);
+    return g_failures ? 1 : 0;
 }

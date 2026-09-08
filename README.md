@@ -68,33 +68,59 @@ canonical local compiler and stays tracked with `text.exe`.
 
 ## Tests
 
-Test executables and screenshots are generated under the ignored `.build` directory.
-The suites generate their own text fixtures; the ignored local `test.txt` is not a
-test dependency.
+Exactly five test entry points are maintained. They share `test_runner.ps1` and
+reuse current builds under `.build`; only changed sources/dependencies rebuild.
+The tiers are disjoint: run both normal and pedantic for full coverage in that
+category. Core is independent and is not rerun by the other tiers.
+
+| Command | Coverage | Desktop input |
+| --- | --- | --- |
+| `runtests.cmd` | Lean document/UTF-8/viewport checks | None |
+| `RunTests_Pedantic.cmd` | Combined 300 MiB mapped deletion, insertion, boundary and snapshot regression | None |
+| `RunTests_UserSim.cmd` | Three smoke scenarios: word editing, cut/paste undo/redo, mouse selection/copy | Keyboard/mouse |
+| `RunTests_UserSimPedantic.cmd` | Remaining GUI regressions, including visual, Unicode and paste cases | Keyboard/mouse |
+| `RunTests_Core.cmd` | Standalone rope API: ranges, ownership, randomized edits, failures, sharing and balance | None |
+
+Every test reports its elapsed time on success or failure. User simulation also
+reports time spent in input, condition waits and application startup; startup can
+include condition waits. Build and large-fixture setup are timed separately.
 
 ```bat
-runtests.cmd
-RunTests_Pedantic.cmd
-runTests_Fast.cmd
-runTests_Look.cmd
-runTests_Look.cmd pedantic
+RunTests_UserSim.cmd --list
+RunTests_UserSimPedantic.cmd --list
+RunTests_UserSimPedantic.cmd --build-only
+RunTests_UserSim.cmd tab_mid_word_roundtrip_and_caret
+RunTests_Core.cmd "C:\fixtures\large.txt"
 ```
 
-- `runtests.cmd` runs the lean default GUI checks.
-- `RunTests_Pedantic.cmd` runs established GUI regression coverage.
-- `runTests_Fast.cmd` exercises piece-list edits against a generated 300 MiB sparse
-  file.
-- `runTests_Look.cmd pedantic` captures the larger visual regression set.
+`--list` enumerates selected GUI tests without opening the app or sending input.
+`--build-only` is supported by all five commands. Named GUI tests work in either
+GUI tier and override that tier's default selection; unknown names fail.
+The optional core fixture path exercises mapped-file ownership and large shared
+cuts. No suite implicitly depends on the ignored local `test.txt`.
+Screenshots from visual tests go to `.build/look`.
 
-GUI tests use real keyboard and mouse input, so avoid interacting with the desktop
-while they run.
+GUI tests use real keyboard and mouse input, so run the UserSim commands only
+when the desktop is available. The other three commands never launch an editor
+window. The former Fast, Look and Utf8 commands have been absorbed into these
+five entry points; there are no compatibility runners to maintain.
+
+Combined cases retain both sets of assertions while sharing setup: mapped
+insert/delete, scrollbar bottom/release, mid-word Tab/Shift+Tab and caret,
+selected-line unindent/no-op, multiline Delete/Backspace/Undo, selection at both
+document edges, and line copying with/without a newline. Unicode
+navigation, deletion, paste and persistence share the scalar scenarios instead
+of running a second corruption-repro executable. Real input is batched per
+shortcut and per text chunk, and tall fixtures use buffered writes.
 
 ## Repository layout
 
 - `main.c`: document model, editor behavior, native window, and renderer.
 - `repro_logger.c` / `repro_logger.h`: optional diagnostic logging.
 - `text_blackbox_tests.c`: public-input GUI behavior tests.
-- `text_fast_tests.c`: document-core large-file checks.
+- `text_tests.c`: document/renderer API checks and mapped-file regressions.
+- `core/core_tests.c`: standalone rope API tests.
+- `test_runner.ps1`: shared build and tier dispatch for the five test commands.
 - `doCommands.txt`: runtime command-popup entries.
 - `document.png`: source application icon.
 
