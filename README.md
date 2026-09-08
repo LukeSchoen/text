@@ -7,8 +7,9 @@ line to open it directly.
 ## Highlights
 
 - Memory-mapped, read-only backing for opened files.
-- Piece-list editing backed by stable append-only blocks, so inserting into a large
-  file does not move the untouched file contents.
+- A balanced rope with constant-time shared range views, reusable node slots,
+  and stable append-only blocks. Unshared typing extends existing ranges directly;
+  other edits splice pointers and preserve shared history without moving old bytes.
 - Lazy line discovery and viewport-only rendering.
 - Logical-offset selections, grouped undo/redo, box selection, and line movement.
 - Optimistic save conflict detection: other processes may read and write open files,

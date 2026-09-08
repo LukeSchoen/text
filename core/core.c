@@ -16,16 +16,72 @@ struct CoreNode {
     size_t refs;
     uint64_t len, pieces;
     unsigned height;
-    CoreAllocator allocator;
+    CorePool *pool;
     CoreNode *left, *right;
     CoreBuffer *buffer;
     uint64_t offset;
+};
+
+typedef struct CoreSlab {
+    struct CoreSlab *next;
+    CoreNode nodes[64];
+} CoreSlab;
+struct CorePool {
+    size_t refs; /* one per allocated node and owning handle */
+    CoreAllocator allocator;
+    CoreSlab *slabs;
+    CoreNode *free;
+    size_t available;
+    CoreNode first; /* the first leaf needs no separate slab allocation */
 };
 
 static void *allocate(CoreAllocator a, size_t n)
 { return a.alloc ? a.alloc(a.user, n) : malloc(n); }
 static void deallocate(CoreAllocator a, void *p)
 { if (p) { if (a.free) a.free(a.user, p); else free(p); } }
+static void pool_drop(CorePool *p)
+{
+    CoreSlab *slab, *next;
+    if (!p || --p->refs) return;
+    for (slab = p->slabs; slab; slab = next) {
+        next = slab->next; deallocate(p->allocator, slab);
+    }
+    deallocate(p->allocator, p);
+}
+static CorePool *ensure_pool(Core *r)
+{
+    if (!r->pool) {
+        CorePool *p = (CorePool *)allocate(r->allocator, sizeof(*p));
+        if (!p) return NULL;
+        memset(p, 0, sizeof(*p)); p->refs = 1; p->allocator = r->allocator;
+        p->free = &p->first; p->available = 1; r->pool = p;
+    }
+    return r->pool;
+}
+/* Reserve before changing any owned links. Once this succeeds, the splice
+   cannot fail halfway through and needs no rollback tree or text snapshot. */
+static int pool_reserve(CorePool *p, size_t count)
+{
+    while (p->available < count) {
+        CoreSlab *slab = (CoreSlab *)allocate(p->allocator, sizeof(*slab));
+        if (!slab) return 0;
+        slab->next = p->slabs; p->slabs = slab;
+        for (unsigned i = 0; i < 64; ++i) {
+            slab->nodes[i].left = p->free; p->free = &slab->nodes[i];
+        }
+        p->available += 64;
+    }
+    return 1;
+}
+static CoreNode *node_new(CorePool *p)
+{
+    CoreNode *n;
+    if (!p->free && !pool_reserve(p, 1)) return NULL;
+    n = p->free; p->free = n->left; --p->available;
+    memset(n, 0, sizeof(*n)); n->refs = 1; n->pool = p;
+    if (p->refs == SIZE_MAX) abort();
+    ++p->refs; return n;
+}
 static unsigned height(CoreNode *n) { return n ? n->height : 0; }
 static uint64_t length(CoreNode *n) { return n ? n->len : 0; }
 static CoreNode *retain(CoreNode *n)
@@ -43,97 +99,119 @@ static void drop(CoreNode *n)
 {
     if (!n || --n->refs) return;
     drop(n->left); drop(n->right); buffer_drop(n->buffer);
-    deallocate(n->allocator, n);
+    CorePool *p = n->pool;
+    n->left = p->free; p->free = n; ++p->available; pool_drop(p);
 }
-static CoreNode *leaf(CoreAllocator a, CoreBuffer *b, uint64_t off, uint64_t len)
+static CoreNode *leaf(CorePool *a, CoreBuffer *b, uint64_t off, uint64_t len)
 {
-    CoreNode *n = (CoreNode *)allocate(a, sizeof(*n));
+    CoreNode *n = node_new(a);
     if (!n) return NULL;
-    memset(n, 0, sizeof(*n));
-    n->refs = 1; n->len = len; n->pieces = 1; n->height = 1;
-    n->allocator = a; n->buffer = buffer_retain(b); n->offset = off;
+    n->len = len; n->pieces = 1; n->height = 1;
+    n->buffer = buffer_retain(b); n->offset = off;
     return n;
 }
-/* All constructors borrow inputs and return one owned reference. */
-static CoreNode *branch(CoreAllocator a, CoreNode *l, CoreNode *r)
+/* Consuming operations transfer one owned reference per input/output.
+   Exclusive nodes are edited directly. Only shared nodes need a private slot. */
+static CoreNode *exclusive(CorePool *p, CoreNode *n)
+{
+    CoreNode *copy;
+    if (n->refs == 1) return n;
+    copy = node_new(p); if (!copy) abort(); /* covered by the reservation */
+    copy->len = n->len; copy->pieces = n->pieces; copy->height = n->height;
+    copy->left = retain(n->left); copy->right = retain(n->right);
+    copy->buffer = buffer_retain(n->buffer); copy->offset = n->offset;
+    drop(n); return copy;
+}
+static void refresh(CoreNode *n)
+{
+    if (n->buffer) { n->pieces = 1; n->height = 1; return; }
+    n->len = n->left->len + n->right->len;
+    n->pieces = n->left->pieces + n->right->pieces;
+    n->height = 1 + (height(n->left) > height(n->right) ? height(n->left) : height(n->right));
+}
+static CoreNode *branch_take(CorePool *p, CoreNode *l, CoreNode *r)
 {
     CoreNode *n;
-    if (!l) return retain(r);
-    if (!r) return retain(l);
-    if (UINT64_MAX - l->len < r->len) return NULL;
-    if (l->buffer && r->buffer && l->buffer == r->buffer &&
-        l->offset + l->len == r->offset)
-        return leaf(a, l->buffer, l->offset, l->len + r->len);
-    n = (CoreNode *)allocate(a, sizeof(*n));
-    if (!n) return NULL;
-    memset(n, 0, sizeof(*n));
-    n->refs = 1; n->len = l->len + r->len;
-    n->pieces = l->pieces + r->pieces;
-    n->height = 1 + (height(l) > height(r) ? height(l) : height(r));
-    n->allocator = a; n->left = retain(l); n->right = retain(r);
+    if (!l) return r;
+    if (!r) return l;
+    if (l->buffer && r->buffer && l->buffer == r->buffer && l->offset + l->len == r->offset) {
+        l = exclusive(p, l); l->len += r->len; drop(r); return l;
+    }
+    n = node_new(p); if (!n) abort();
+    n->left = l; n->right = r; refresh(n); return n;
+}
+static CoreNode *rotate_left(CorePool *p, CoreNode *n)
+{
+    CoreNode *r = exclusive(p, n->right);
+    n->right = r->left; r->left = n;
+    refresh(n); refresh(r); return r;
+}
+static CoreNode *rotate_right(CorePool *p, CoreNode *n)
+{
+    CoreNode *l = exclusive(p, n->left);
+    n->left = l->right; l->right = n;
+    refresh(n); refresh(l); return l;
+}
+static CoreNode *balance_take(CorePool *p, CoreNode *n)
+{
+    refresh(n);
+    if (height(n->left) > height(n->right) + 1) {
+        if (height(n->left->left) < height(n->left->right))
+            n->left = rotate_left(p, exclusive(p, n->left));
+        return rotate_right(p, n);
+    }
+    if (height(n->right) > height(n->left) + 1) {
+        if (height(n->right->right) < height(n->right->left))
+            n->right = rotate_right(p, exclusive(p, n->right));
+        return rotate_left(p, n);
+    }
     return n;
 }
-static CoreNode *balance(CoreAllocator a, CoreNode *l, CoreNode *r)
+static CoreNode *join_take(CorePool *p, CoreNode *l, CoreNode *r)
 {
-    CoreNode *x = NULL, *y = NULL, *out = NULL;
+    if (!l || !r) return l ? l : r;
     if (height(l) > height(r) + 1) {
-        if (height(l->left) >= height(l->right)) {
-            x = branch(a, l->right, r);
-            if (x) out = branch(a, l->left, x);
-        } else {
-            x = branch(a, l->left, l->right->left);
-            y = branch(a, l->right->right, r);
-            if (x && y) out = branch(a, x, y);
-        }
-    } else if (height(r) > height(l) + 1) {
-        if (height(r->right) >= height(r->left)) {
-            x = branch(a, l, r->left);
-            if (x) out = branch(a, x, r->right);
-        } else {
-            x = branch(a, l, r->left->left);
-            y = branch(a, r->left->right, r->right);
-            if (x && y) out = branch(a, x, y);
-        }
-    } else return branch(a, l, r);
-    drop(x); drop(y); return out;
+        l = exclusive(p, l);
+        l->right = join_take(p, l->right, r);
+        return balance_take(p, l);
+    }
+    if (height(r) > height(l) + 1) {
+        r = exclusive(p, r);
+        r->left = join_take(p, l, r->left);
+        return balance_take(p, r);
+    }
+    return branch_take(p, l, r);
 }
-static CoreNode *join(CoreAllocator a, CoreNode *l, CoreNode *r)
+static void split_take(CorePool *p, CoreNode *n, uint64_t off, CoreNode **l, CoreNode **r)
 {
-    CoreNode *x, *out;
-    if (!l || !r) return branch(a, l, r);
-    if (height(l) > height(r) + 1) {
-        x = join(a, l->right, r);
-        if (!x) return NULL;
-        out = balance(a, l->left, x);
-    } else if (height(r) > height(l) + 1) {
-        x = join(a, l, r->left);
-        if (!x) return NULL;
-        out = balance(a, x, r->right);
-    } else return branch(a, l, r);
-    drop(x); return out;
+    CoreNode *a, *b, *x, *y;
+    if (!off) { *l = NULL; *r = n; return; }
+    if (off == n->len) { *l = n; *r = NULL; return; }
+    n = exclusive(p, n);
+    if (n->buffer) {
+        *r = leaf(p, n->buffer, n->offset + off, n->len - off);
+        if (!*r) abort();
+        n->len = off; *l = n; return;
+    }
+    a = n->left; b = n->right;
+    n->left = n->right = NULL; drop(n); /* reuse the detached branch slot */
+    if (off < a->len) {
+        split_take(p, a, off, &x, &y); *l = x; *r = join_take(p, y, b);
+    } else {
+        split_take(p, b, off - a->len, &x, &y); *l = join_take(p, a, x); *r = y;
+    }
 }
-/* A range shares every fully enclosed subtree. Only its boundary paths are
-   rebuilt. In particular, a whole-rope slice is just a reference increment. */
-static CoreNode *slice(CoreAllocator a, CoreNode *n, uint64_t off, uint64_t len)
+static CoreNode *range_take(CorePool *p, CoreNode *n, uint64_t off, uint64_t len)
 {
-    CoreNode *l, *r, *out;
-    uint64_t left_len;
-    if (!len) return NULL;
-    if (!off && len == n->len) return retain(n);
-    if (n->buffer) return leaf(a, n->buffer, n->offset + off, len);
-    left_len = n->left->len;
-    if (off >= left_len) return slice(a, n->right, off - left_len, len);
-    if (len <= left_len - off) return slice(a, n->left, off, len);
-    l = slice(a, n->left, off, left_len - off);
-    if (!l) return NULL;
-    r = slice(a, n->right, 0, len - (left_len - off));
-    out = r ? join(a, l, r) : NULL;
-    drop(l); drop(r); return out;
+    CoreNode *left, *middle, *right;
+    split_take(p, n, off, &left, &middle); drop(left);
+    split_take(p, middle, len, &middle, &right); drop(right);
+    return middle;
 }
 static int valid(const Core *r, uint64_t off, uint64_t len)
 { return r && off <= core_len(r) && len <= core_len(r) - off; }
 static void commit(Core *r, CoreNode *n)
-{ CoreNode *old = r->root; r->root = n; drop(old); }
+{ CoreNode *old = r->root; r->root = n; r->start = 0; r->len = length(n); drop(old); }
 
 int core_init(Core *r, const CoreAllocator *a)
 {
@@ -144,16 +222,37 @@ void core_dispose(Core *r)
 {
     if (!r) return;
     drop(r->root); buffer_drop(r->append);
-    r->root = NULL; r->append = NULL;
+    r->root = NULL; r->append = NULL; r->start = r->len = 0;
+    pool_drop(r->pool); r->pool = NULL;
 }
-uint64_t core_len(const Core *r) { return r ? length(r->root) : 0; }
-uint64_t core_pieces(const Core *r) { return r && r->root ? r->root->pieces : 0; }
+uint64_t core_len(const Core *r) { return r ? r->len : 0; }
+static uint64_t piece_index(CoreNode *n, uint64_t off)
+{
+    uint64_t index = 0;
+    while (!n->buffer) {
+        if (off < n->left->len) n = n->left;
+        else { off -= n->left->len; index += n->left->pieces; n = n->right; }
+    }
+    return index;
+}
+uint64_t core_pieces(const Core *r)
+{
+    if (!r || !r->len) return 0;
+    if (!r->start && r->len == r->root->len) return r->root->pieces;
+    return piece_index(r->root, r->start + r->len - 1) - piece_index(r->root, r->start) + 1;
+}
 unsigned core_height(const Core *r) { return r ? height(r->root) : 0; }
+static void set_view(Core *out, CoreNode *root, uint64_t start, uint64_t len)
+{
+    CoreNode *old = out->root;
+    out->root = len ? retain(root) : NULL;
+    out->start = len ? start : 0; out->len = len;
+    drop(old);
+}
 void core_clone(Core *out, const Core *src)
 {
-    CoreNode *n;
     if (!out || !src || out == src) return;
-    n = retain(src->root); core_dispose(out); out->root = n;
+    set_view(out, src->root, src->start, src->len);
 }
 int core_from_memory(Core *out, const void *data, uint64_t len,
                      CoreReleaseFn release, void *user)
@@ -170,39 +269,64 @@ int core_from_memory(Core *out, const void *data, uint64_t len,
     memset(b, 0, sizeof(*b));
     b->refs = 1; b->data = (const char *)data; b->len = len;
     b->allocator = out->allocator;
-    n = leaf(out->allocator, b, 0, len);
+    CorePool *pool = ensure_pool(out);
+    n = pool ? leaf(pool, b, 0, len) : NULL;
     if (!n) { buffer_drop(b); return 0; }
     b->release = release; b->user = user;
-    buffer_drop(b); core_dispose(out); out->root = n; return 1;
+    buffer_drop(b); buffer_drop(out->append); out->append = NULL;
+    commit(out, n); return 1;
 }
 int core_slice(Core *out, const Core *src, uint64_t off, uint64_t len)
 {
-    CoreNode *n;
     if (!out || !valid(src, off, len)) return 0;
-    n = slice(out->allocator, src->root, off, len);
-    if (len && !n) return 0;
-    commit(out, n); return 1;
+    set_view(out, src->root, src->start + off, len); return 1;
 }
 int core_replace(Core *r, uint64_t off, uint64_t len, const Core *insert)
 {
-    CoreNode *l = NULL, *tail = NULL, *x = NULL, *out = NULL;
-    uint64_t total, right_len, ins = core_len(insert);
+    CoreNode *l, *tail, *middle = NULL, *deleted, *root;
+    uint64_t total, ins = core_len(insert);
+    CorePool *pool;
+    unsigned source_height, insert_height;
+    size_t reserve;
     if (!valid(r, off, len)) return 0;
     total = core_len(r);
     if (ins > UINT64_MAX - (total - len)) return 0;
     if (!len && !ins) return 1;
-    right_len = total - off - len;
-    l = slice(r->allocator, r->root, 0, off);
-    if (off && !l) goto fail;
-    tail = slice(r->allocator, r->root, off + len, right_len);
-    if (right_len && !tail) goto fail;
-    x = join(r->allocator, l, insert ? insert->root : NULL);
-    if ((off || ins) && !x) goto fail;
-    out = join(r->allocator, x, tail);
-    if ((off || ins || right_len) && !out) goto fail;
-    drop(l); drop(tail); drop(x); commit(r, out); return 1;
-fail:
-    drop(l); drop(tail); drop(x); drop(out); return 0;
+    if (len == total) {
+        set_view(r, ins ? insert->root : NULL, ins ? insert->start : 0, ins);
+        return 1;
+    }
+    if (!ins && (!off || off + len == total)) {
+        set_view(r, r->root, r->start + (!off ? len : 0), total - len);
+        return 1;
+    }
+    pool = ensure_pool(r); if (!pool) return 0;
+    source_height = height(r->root); insert_height = ins ? height(insert->root) : 0;
+    /* Four source-boundary splits, two insert-boundary splits and two joins.
+       Budget private slots for
+       shared paths and rotations before transferring ownership. Whole-root
+       concatenation only needs the difference in heights plus rotations. */
+    if (!len && (!off || off == total) && !r->start && total == length(r->root) &&
+        (!ins || (!insert->start && ins == length(insert->root)))) {
+        unsigned difference = source_height > insert_height ? source_height - insert_height : insert_height - source_height;
+        reserve = 8 * ((size_t)difference + 4);
+    } else reserve = 32 * ((size_t)source_height + insert_height + 4);
+    unsigned maximum_height = source_height > insert_height ? source_height : insert_height;
+    if (maximum_height < 7) {
+        size_t small_tree_bound = ((size_t)4 << maximum_height) + 8;
+        if (reserve > small_tree_bound) reserve = small_tree_bound;
+    }
+    if (!pool_reserve(pool, reserve)) return 0;
+    /* Capture insert before touching r: self insertion and overlapping views
+       must retain their previous byte ordering. */
+    if (ins) middle = range_take(pool, retain(insert->root), insert->start, ins);
+    root = r->root; r->root = NULL;
+    root = range_take(pool, root, r->start, total);
+    split_take(pool, root, off, &l, &tail);
+    split_take(pool, tail, len, &deleted, &tail); drop(deleted);
+    root = join_take(pool, join_take(pool, l, middle), tail);
+    r->root = root; r->start = 0; r->len = length(root);
+    return 1;
 }
 static CoreNode *locate(CoreNode *n, uint64_t *off)
 {
@@ -211,6 +335,29 @@ static CoreNode *locate(CoreNode *n, uint64_t *off)
         else { *off -= n->left->len; n = n->right; }
     }
     return n;
+}
+/* All ancestors must be exclusive: a leaf can have refs=1 yet still belong
+   to a shared root. No changes are made until the whole path is checked. */
+static int append_in_place(Core *r, uint64_t off, const void *data, uint64_t len)
+{
+    CoreNode *path[128], *n = r->root;
+    CoreBuffer *b = r->append;
+    unsigned count = 0;
+    uint64_t local;
+    if (!off || r->start || r->len != length(n) || !b || len > b->len - b->used) return 0;
+    local = off - 1;
+    while (n) {
+        if (n->refs != 1 || count == 128) return 0;
+        path[count++] = n;
+        if (n->buffer) break;
+        if (local < n->left->len) n = n->left;
+        else { local -= n->left->len; n = n->right; }
+    }
+    if (!n || local + 1 != n->len || n->buffer != b || n->offset + n->len != b->used) return 0;
+    memcpy((char *)b->data + b->used, data, (size_t)len);
+    b->used += len;
+    for (unsigned i = 0; i < count; ++i) path[i]->len += len;
+    r->len += len; return 1;
 }
 int core_insert(Core *r, uint64_t off, const void *data, uint64_t len)
 {
@@ -221,9 +368,12 @@ int core_insert(Core *r, uint64_t off, const void *data, uint64_t len)
     if (!valid(r, off, 0) || (len && !data) || len > SIZE_MAX ||
         len > UINT64_MAX - core_len(r)) return 0;
     if (!len) return 1;
+    if (append_in_place(r, off, data, len)) return 1;
     b = r->append;
     if (!b || len > b->len - b->used) {
         capacity = len > 65536 ? len : 65536;
+        if (capacity <= SIZE_MAX - 65535)
+            capacity = (capacity + 65535) & ~UINT64_C(65535);
         b = (CoreBuffer *)allocate(r->allocator, sizeof(*b));
         if (!b) return 0;
         memset(b, 0, sizeof(*b)); b->refs = 1; b->allocator = r->allocator;
@@ -235,14 +385,15 @@ int core_insert(Core *r, uint64_t off, const void *data, uint64_t len)
     /* Extend the preceding run when typing at its physical end. Historical
        versions keep their old leaf length; their bytes are never modified. */
     if (off) {
-        local = off - 1; previous = locate(r->root, &local);
+        local = r->start + off - 1; previous = locate(r->root, &local);
         if (previous && local + 1 == previous->len && previous->buffer == b &&
-            previous->offset + previous->len == begin) extend = previous->len;
+            previous->offset + previous->len == begin) extend = previous->len < off ? previous->len : off;
     }
-    n = leaf(r->allocator, b, begin - extend, extend + len);
+    CorePool *pool = ensure_pool(r);
+    n = pool ? leaf(pool, b, begin - extend, extend + len) : NULL;
     if (!n) { if (fresh) buffer_drop(b); return 0; }
     memcpy((char *)b->data + begin, data, (size_t)len);
-    fragment.root = n;
+    fragment.root = n; fragment.len = n->len;
     ok = core_replace(r, off - extend, extend, &fragment);
     drop(n);
     if (!ok) { if (fresh) buffer_drop(b); return 0; }
@@ -257,7 +408,7 @@ int core_cut(Core *r, uint64_t off, uint64_t len, Core *out)
     part.allocator = out->allocator;
     if (!core_slice(&part, r, off, len)) return 0;
     if (!core_replace(r, off, len, NULL)) { core_dispose(&part); return 0; }
-    commit(out, part.root); return 1;
+    set_view(out, part.root, part.start, part.len); core_dispose(&part); return 1;
 }
 int core_run(const Core *r, uint64_t off, CoreRun *out)
 {
@@ -265,9 +416,12 @@ int core_run(const Core *r, uint64_t off, CoreRun *out)
     if (!out || !valid(r, off, 0)) return 0;
     out->data = NULL; out->len = 0;
     if (off == core_len(r)) return 1;
-    n = locate(r->root, &off);
+    uint64_t remaining = r->len - off;
+    off += r->start; n = locate(r->root, &off);
     out->data = n->buffer->data + n->offset + off;
-    out->len = n->len - off; return 1;
+    out->len = n->len - off;
+    if (out->len > remaining) out->len = remaining;
+    return 1;
 }
 static int runs(CoreNode *n, uint64_t off, uint64_t len, CoreRunFn fn, void *user)
 {
@@ -282,7 +436,7 @@ static int runs(CoreNode *n, uint64_t off, uint64_t len, CoreRunFn fn, void *use
 int core_runs(const Core *r, uint64_t off, uint64_t len, CoreRunFn fn, void *user)
 {
     if (!fn || !valid(r, off, len)) return 0;
-    return runs(r->root, off, len, fn, user);
+    return runs(r->root, r->start + off, len, fn, user);
 }
 typedef struct Read { char *out; } Read;
 static int read_run(void *user, const char *data, uint64_t len)

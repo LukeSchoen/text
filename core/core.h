@@ -24,10 +24,13 @@ typedef struct CoreAllocator {
 } CoreAllocator;
 typedef struct CoreNode CoreNode;
 typedef struct CoreBuffer CoreBuffer;
+typedef struct CorePool CorePool;
 typedef struct Core {
     CoreNode *root;          /* private */
     CoreBuffer *append;      /* private: stable append-only allocation */
     CoreAllocator allocator;
+    CorePool *pool;          /* private: reusable node slots */
+    uint64_t start, len;     /* private: retained root range */
 } Core;
 
 /* Initialize a fresh handle. allocator=NULL selects malloc/free; otherwise
@@ -38,6 +41,8 @@ uint64_t core_len(const Core *rope);
 void core_clone(Core *out, const Core *source);
 int core_from_memory(Core *out, const void *data, uint64_t len,
                      CoreReleaseFn release, void *user);
+/* Retain a root plus byte range. No allocation or tree traversal, including
+   nested slices. Releasing old output contents can still free old storage. */
 int core_slice(Core *out, const Core *source, uint64_t start, uint64_t len);
 /* Replace [start,start+len) with the entire insert rope. NULL means delete.
    Self-insertion and shared subtrees are supported. */
@@ -57,15 +62,18 @@ int core_runs(const Core *rope, uint64_t start, uint64_t len,
               CoreRunFn sink, void *user);
 int core_read(const Core *rope, uint64_t start, uint64_t len, void *out);
 
-/* O(1) structural diagnostics; counts logical leaves, including shared ones. */
+/* Logical leaf count: O(1) for full roots, O(log pieces) for partial views.
+   Height is the retained tree height (O(1)), including for a partial view. */
 uint64_t core_pieces(const Core *rope);
 unsigned core_height(const Core *rope);
 
-/* Costs: wrapping external memory and cloning into an empty handle O(1).
-   Slice/cut/replace O(log pieces) metadata, independent of byte count.
-   Fresh bytes must be copied: core_insert O(bytes + log pieces).
-   Serialization O(bytes) for copying, O(runs) for handing out spans.
+/* Costs: clone and slice retain a root/range in O(1), with no allocation.
+   Edit lookup and splice work touch O(log pieces) metadata, never old bytes.
+   Node slots are recycled; the allocator is called only when a pool grows.
+   Unshared contiguous typing extends its leaf and ancestor byte counters
+   without allocating nodes. Shared paths keep their historical versions.
+   core_insert must copy new input: O(bytes + log pieces).
    Releasing the last owner costs O(unique nodes freed); an output handle's
-   old contents also incur this cost. No content-hash deduplication: sharing
-   is structural and preserves buffer identity, including overlapping ranges. */
+   old contents also incur this cost. Partial views can retain the whole root.
+   No content-hash deduplication: sharing preserves buffer identity. */
 #endif

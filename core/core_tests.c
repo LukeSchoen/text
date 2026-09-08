@@ -132,6 +132,36 @@ static void randomized(void)
         equal(&r, model, len);
         for (int i = 0; i < 8; ++i) equal(&snapshots[i], saved[i], saved_len[i]);
     }
+    /* Keep a fragmented document alive instead of frequently slicing down
+       to a short string. Exercise overlapping shared inserts and deletions. */
+    for (size_t i = 0; i < 4096; ++i) model[i] = (char)('a' + i % 26);
+    len = 4096;
+    core_dispose(&r); CHECK(core_insert(&r, 0, model, len));
+    for (unsigned step = 0; step < 2000; ++step) {
+        char input[24];
+        size_t off = random_u32() % (len + 1), remove = random_u32() % 12;
+        size_t source = random_u32() % (len + 1), add = random_u32() % sizeof(input);
+        if (remove > len - off) remove = len - off;
+        if (add > len - source) add = len - source;
+        if (len > 6000) add = 0;
+        memcpy(input, model + source, add);
+        CHECK(core_slice(&part, &r, source, add));
+        CHECK(core_replace(&r, off, remove, &part));
+        memmove(model + off + add, model + off + remove, len - off - remove);
+        memcpy(model + off, input, add); len = len - remove + add;
+        equal(&r, model, len);
+        if (!(step % 31)) {
+            unsigned slot = random_u32() % 8;
+            core_clone(&snapshots[slot], &r);
+            memcpy(saved[slot], model, len); saved_len[slot] = len;
+        }
+        unsigned check_slot = step % 8;
+        equal(&snapshots[check_slot], saved[check_slot], saved_len[check_slot]);
+        unsigned levels = 0;
+        for (uint64_t pieces = core_pieces(&r); pieces; pieces >>= 1) ++levels;
+        CHECK(core_height(&r) <= 2 * levels + 1);
+    }
+    for (int i = 0; i < 8; ++i) equal(&snapshots[i], saved[i], saved_len[i]);
     core_dispose(&r); core_dispose(&part);
     for (int i = 0; i < 8; ++i) core_dispose(&snapshots[i]);
     CHECK(!m.live);
@@ -199,7 +229,156 @@ static void structure_and_overflow(void)
     CHECK(core_len(&r) == (UINT64_C(1) << 63));
     CHECK(!core_replace(&r, core_len(&r), 0, &r));
     CHECK(core_insert(&r, 0, "x", 1));
+    CHECK(core_slice(&cut, &r, 1, UINT64_C(1) << 62));
+    CHECK(core_replace(&r, UINT64_C(1) << 62, 1, &cut));
+    CHECK(core_len(&r) == (UINT64_C(3) << 62));
+    CoreRun last;
+    CHECK(core_run(&r, core_len(&r) - 1, &last) && last.len == 1 && last.data[0] == 'x');
+    core_dispose(&cut);
     core_dispose(&r); core_dispose(&one); CHECK(!m.live);
+}
+
+/* Allocation budgets are part of the public API contract being exercised.
+   No private nodes or editor state are touched by these tests. */
+static void views_and_allocation_budgets(void)
+{
+    Memory m = {0}; Core r = make_core(&m), view = make_core(&m), nested = make_core(&m);
+    Core saved = make_core(&m), cut = make_core(&m), one = make_core(&m);
+    char bytes[4096], actual[4096];
+    memset(bytes, 'x', sizeof(bytes));
+    CHECK(core_from_memory(&one, "x", 1, NULL, NULL));
+    for (unsigned i = 0; i < sizeof(bytes); ++i) CHECK(core_replace(&r, core_len(&r), 0, &one));
+    size_t before = m.calls;
+    CHECK(core_slice(&view, &r, 100, 3000));
+    for (unsigned i = 0; i < 10000; ++i) {
+        CHECK(core_slice(&nested, &view, 13, 1000));
+        CHECK(core_slice(&nested, &nested, 1, 999));
+    }
+    CHECK(m.calls == before);
+    CHECK(core_len(&nested) == 999 && core_pieces(&nested) == 999);
+    CoreRun run;
+    CHECK(core_run(&nested, 998, &run) && run.len == 1);
+    CHECK(core_read(&nested, 0, 999, actual) && !memcmp(actual, bytes, 999));
+    core_dispose(&r); core_dispose(&view);
+    CHECK(core_read(&nested, 0, 999, actual) && !memcmp(actual, bytes, 999));
+    core_clone(&saved, &nested);
+    CHECK(core_insert(&nested, 500, "Y", 1));
+    CHECK(core_read(&saved, 0, 999, actual) && !memcmp(actual, bytes, 999));
+    CHECK(core_read(&nested, 500, 1, actual) && actual[0] == 'Y');
+    core_dispose(&nested); core_dispose(&saved);
+
+    CHECK(core_from_memory(&r, "LR", 2, NULL, NULL));
+    CHECK(core_insert(&r, 1, "x", 1));
+    before = m.calls;
+    m.fail = m.calls + 1; /* all ordinary typing must succeed without allocating */
+    for (unsigned i = 0; i < 10000; ++i) CHECK(core_insert(&r, 2 + i, "x", 1));
+    CHECK(m.calls == before && core_pieces(&r) == 3);
+    CHECK(core_run(&r, 10002, &run) && run.data[0] == 'R');
+    m.fail = 0;
+    core_clone(&saved, &r);
+    CHECK(core_insert(&r, 10002, "Y", 1));
+    CHECK(core_len(&saved) == 10003 && core_len(&r) == 10004);
+    CHECK(core_run(&saved, 10002, &run) && run.data[0] == 'R');
+    core_dispose(&r); core_dispose(&saved);
+
+    CHECK(core_from_memory(&r, bytes, sizeof(bytes), NULL, NULL));
+    /* Warm the reusable metadata slots, then keep doing real middle edits. */
+    for (unsigned i = 0; i < 8; ++i) {
+        CHECK(core_cut(&r, 1000, 2000, &cut));
+        CHECK(core_replace(&r, 1000, 0, &cut));
+    }
+    before = m.calls; m.fail = m.calls + 1;
+    for (unsigned i = 0; i < 1000; ++i) {
+        CHECK(core_cut(&r, 1000, 2000, &cut));
+        CHECK(core_replace(&r, 1000, 0, &cut));
+    }
+    CHECK(m.calls == before);
+    CHECK(core_read(&r, 0, sizeof(bytes), actual) && !memcmp(bytes, actual, sizeof(bytes)));
+    m.fail = 0;
+    core_dispose(&r); core_dispose(&cut); core_dispose(&one);
+    /* A paste larger than one block reserves room for subsequent typing. */
+    char *paste = (char *)malloc(70000);
+    CHECK(paste != NULL); memset(paste, 'p', 70000);
+    CHECK(core_insert(&r, 0, paste, 70000));
+    before = m.calls; m.fail = m.calls + 1;
+    for (unsigned i = 0; i < 10000; ++i) CHECK(core_insert(&r, 70000 + i, "x", 1));
+    CHECK(m.calls == before && core_pieces(&r) == 1);
+    m.fail = 0; core_dispose(&r); free(paste);
+    CHECK(!m.live);
+    puts("Allocation budgets: 10,000 nested views, 10,000 middle typing inserts, 1,000 warm cut/reinsert pairs: zero allocator calls");
+}
+
+static void typing_with_history(void)
+{
+    Memory m = {0}; Core r = make_core(&m), history[1000]; CoreRun run;
+    CHECK(core_from_memory(&r, "LR", 2, NULL, NULL));
+    for (unsigned i = 0; i < 1000; ++i) history[i] = make_core(&m);
+    size_t before = m.calls;
+    for (unsigned i = 0; i < 1000; ++i) {
+        core_clone(&history[i], &r);
+        CHECK(core_insert(&r, i + 1, "x", 1));
+    }
+    size_t allocations = m.calls - before;
+    CHECK(allocations < 150 && core_pieces(&r) == 3);
+    core_dispose(&r);
+    for (unsigned i = 0; i < 1000; ++i) {
+        CHECK(core_len(&history[i]) == i + 2);
+        CHECK(core_run(&history[i], i + 1, &run) && run.len == 1 && run.data[0] == 'R');
+        if (i) CHECK(core_run(&history[i], i, &run) && run.data[0] == 'x');
+        core_dispose(&history[i]);
+    }
+    CHECK(!m.live);
+    printf("1,000 typing edits retaining every version: %zu allocator calls, snapshots intact\n", allocations);
+}
+
+static void pool_growth_failures(void)
+{
+    unsigned failed = 0;
+    for (unsigned op = 0; op < 3; ++op) {
+        Memory m = {0}; Core r = make_core(&m), out = make_core(&m), one = make_core(&m), saved = make_core(&m);
+        char model[4096], before_text[4096], after_text[4096], old_out[16], new_out[16];
+        size_t len = 512;
+        memset(model, 'x', len);
+        CHECK(core_from_memory(&one, "Y", 1, NULL, NULL));
+        CHECK(core_insert(&r, 0, model, len));
+        CHECK(core_insert(&out, 0, "old", 3));
+        /* Reject the next actual allocator request; allow cached slots to be
+           consumed first so a failure can occur after work has started. */
+        m.fail = m.calls + 1;
+        for (unsigned step = 0; step < 1000; ++step) {
+            size_t off = (step * 37) % len;
+            size_t old_len = len;
+            size_t out_len = (size_t)core_len(&out);
+            CHECK(core_read(&r, 0, len, before_text));
+            CHECK(out_len <= sizeof(old_out) && core_read(&out, 0, out_len, old_out));
+            int ok;
+            if (op == 0) ok = core_insert(&r, off, "Y", 1);
+            else if (op == 1) ok = core_replace(&r, off, 1, &one);
+            else {
+                core_clone(&saved, &r);
+                ok = core_cut(&r, off, 1, &out);
+            }
+            if (!ok) {
+                ++failed;
+                CHECK(core_len(&r) == old_len && core_read(&r, 0, old_len, after_text));
+                CHECK(!memcmp(before_text, after_text, old_len));
+                CHECK(core_len(&out) == out_len && core_read(&out, 0, out_len, new_out));
+                CHECK(!memcmp(old_out, new_out, out_len));
+                if (op == 2) {
+                    CHECK(core_read(&saved, 0, old_len, after_text));
+                    CHECK(!memcmp(before_text, after_text, old_len));
+                }
+                break;
+            }
+            len = (size_t)core_len(&r);
+            CHECK(len && len < sizeof(model));
+        }
+        m.fail = 0;
+        core_dispose(&r); core_dispose(&out); core_dispose(&one); core_dispose(&saved);
+        CHECK(!m.live);
+    }
+    CHECK(failed == 3);
+    puts("Pool growth failures: insert, replace and cut preserve their inputs");
 }
 
 #ifdef _WIN32
@@ -278,6 +457,9 @@ int main(int argc, char **argv) {
     RUN("randomized_edits_and_snapshots", randomized());
     RUN("allocation_failures", allocation_failures());
     RUN("structure_and_overflow", structure_and_overflow());
+    RUN("views_and_allocation_budgets", views_and_allocation_budgets());
+    RUN("pool_growth_failures", pool_growth_failures());
+    RUN("typing_with_history", typing_with_history());
 #ifdef _WIN32
     if (argc > 1) RUN("large_mapped_fixture", large_fixture(argv[1]));
 #else
