@@ -15,6 +15,19 @@ line to open it directly.
   while stale editor windows must explicitly reload or overwrite.
 - One document per window with fast open/save/close cycles.
 
+## Install and uninstall
+
+Run `install.cmd` beside `text.exe` to register file associations, script edit
+actions, and a **Text** shortcut in your Windows account's Start menu. Then open
+Start or taskbar search and type **Text**. Windows may take a moment to discover
+the shortcut; the installer cannot guarantee the first search result.
+
+Keep the folder in place, or rerun `install.cmd` after moving it to update the
+shortcut and associations. `uninstall.cmd` removes the registrations and shortcuts
+(if they still point to this installation). Neither script requires administrator
+rights. Reinstalling also removes the old **Notepad (Text)** alias if it points to
+this installation.
+
 ## Keyboard shortcuts
 
 - `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`: open, save, and save as.
