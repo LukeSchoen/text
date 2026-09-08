@@ -881,6 +881,8 @@ static bool line_index_push_start(LineIndex *li, u64 off)
     li->cap = new_cap;
   }
   if (!line_index_ensure_block_capacity(li, li->count + 1)) return false;
+  /* Discarded blocks are reset only when reused, not on every deletion. */
+  if ((line & (LINE_INDEX_BLOCK_SIZE - 1)) == 0) li->block_add[block] = 0;
   {
     int64_t add = li->block_add[block];
     if (add >= 0) li->starts[li->count++] = off - (u64)add;
@@ -914,10 +916,6 @@ static void line_index_invalidate_from(LineIndex *li, u64 off)
     }
   }
   li->count = keep;
-  {
-    u64 keep_blocks = line_index_blocks_for_count(keep);
-    for (u64 b = keep_blocks; b < li->block_cap; ++b) li->block_add[b] = 0;
-  }
   if (li->scanned_to >= off) li->scanned_to = off;
   li->eof = false;
 }
@@ -1475,14 +1473,14 @@ static bool doc_commit_prepared_save(Document *doc, const WCHAR *path,
 /******************************************************************************
  * Line Index
  ******************************************************************************/
-static void scan_for_lines(Document *doc, u64 target)
+static void scan_for_lines_until(Document *doc, u64 target, u64 end)
 {
   LineIndex *li = &doc->lines;
   u64 budget = LINE_DISCOVERY_BUDGET;
-  while (!li->eof && li->count <= target && budget) {
+  while (!li->eof && li->count <= target && budget && li->scanned_to < end) {
     CoreRun run;
     core_run(&doc->rope, li->scanned_to, &run);
-    u64 take = min_u64(run.len, budget);
+    u64 take = min_u64(min_u64(run.len, budget), end - li->scanned_to);
     for (u64 i = 0; i < take; ++i) {
       ++li->scanned_to;
       --budget;
@@ -1493,6 +1491,12 @@ static void scan_for_lines(Document *doc, u64 target)
     }
     li->eof = li->scanned_to == doc->len;
   }
+  if (li->scanned_to == doc->len) li->eof = true;
+}
+
+static void scan_for_lines(Document *doc, u64 target)
+{
+  scan_for_lines_until(doc, target, doc->len);
 }
 
 static void doc_ensure_line(Document *doc, u64 line)
@@ -1659,9 +1663,7 @@ static u64 doc_line_visual_width(Document *doc, u64 start, u64 end)
 static u64 doc_line_visual_col_from_byte_col(Document *doc, u64 line, u64 byte_col)
 {
   u64 start = doc_line_start(doc, line);
-  u64 end = doc_line_length_clamped(doc, start, UINT32_MAX);
-  u64 max_byte_col = end - start;
-  if (byte_col > max_byte_col) byte_col = max_byte_col;
+  byte_col = min_u64(byte_col, doc->len - start);
   return doc_line_visual_width(doc, start, start + byte_col);
 }
 
@@ -1725,7 +1727,14 @@ static void doc_offset_to_line_col(Document *doc, u64 off, u64 *out_line, u64 *o
   u64 hi;
   u64 line = 0;
   if (off > doc->len) off = doc->len;
-  doc_discover_all_lines(doc);
+  /* Offset lookup needs only the prefix through off. In particular, deletion
+     invalidates the suffix; discovering it here made each delete scan to EOF. */
+  while (doc->lines.scanned_to < off && !doc->lines.eof)
+  {
+    u64 before = doc->lines.scanned_to;
+    scan_for_lines_until(doc, UINT64_MAX, off);
+    if (doc->lines.scanned_to == before) break;
+  }
   if (doc->lines.count == 0)
   {
     *out_line = 0;
@@ -3985,8 +3994,11 @@ static void handle_key(App *app, WPARAM vk)
       }
       else
       {
+        /* We already know this caret's column. Decode only the removed
+           character rather than rescanning the entire prefix on backspace. */
+        u64 width = doc_line_visual_width(&app->doc, del_start, off);
+        app->cc -= min_u64(app->cc, width);
         app->co = del_start;
-        sync_caret_from_offsets(app);
       }
       app_doc_delete(app, del_start, del);
       update_title(app);

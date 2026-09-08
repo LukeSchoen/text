@@ -101,6 +101,8 @@ static bool load_fixture(Document *doc, const wchar_t *path) {
     return true;
 }
 
+static double now_ms(void);
+
 static bool test_large_mapped_edits(const wchar_t *path) {
     const char *name = "large_mapped_edits";
     Document doc;
@@ -120,6 +122,38 @@ static bool test_large_mapped_edits(const wchar_t *path) {
         actual[0] != 'L' || actual[10001] != 'R' ||
         memcmp(actual + 1, inserted, sizeof(inserted))) goto done;
     if (!core_read(&saved, 10000, 3, actual) || memcmp(actual, "LDR", 3)) goto done;
+    /* Delete half a single mapped buffer: survivors must still point directly
+       into that buffer. Resolving the deletion caret must not read the tail. */
+    core_clone(&doc.rope, &saved);
+    doc.len = original_len;
+    doc_reset_lines(&doc);
+    CoreRun original, left, right;
+    u64 line, col, removed = original_len / 2;
+    core_run(&saved, 0, &original);
+    double started = now_ms();
+    if (!doc_delete_range(&doc, 10001, removed)) goto done;
+    double delete_ms = now_ms() - started;
+    if (core_pieces(&doc.rope) != 2 ||
+        !core_run(&doc.rope, 0, &left) || left.data != original.data || left.len != 10001 ||
+        !core_run(&doc.rope, 10001, &right) || right.data != original.data + 10001 + removed ||
+        right.len != original_len - removed - 10001) goto done;
+    started = now_ms();
+    doc_offset_to_line_col(&doc, 10001, &line, &col);
+    printf("DELETE 150 MiB: %.6f ms; resolve caret: %.6f ms; indexed %llu bytes\n",
+           delete_ms, now_ms() - started, (unsigned long long)doc.lines.scanned_to);
+    if (line != 0 || col != 10001 || doc.lines.scanned_to > 10001) goto done;
+    /* Shift cached blocks, discard them with a newline delete, then reuse them.
+       Stale lazy offsets must never leak into the rebuilt line index. */
+    doc_clear(&doc);
+    memset(inserted, '\n', 4098);
+    if (!doc_insert_bytes(&doc, 0, inserted, 4098, NULL)) goto done;
+    doc_discover_all_lines(&doc);
+    if (!doc_insert_bytes(&doc, 1, "X", 1, NULL) ||
+        !doc_delete_range(&doc, 3, 2)) goto done;
+    doc_discover_all_lines(&doc);
+    if (!doc.lines.eof || doc.lines.count != 4097) goto done;
+    for (u64 i = 0; i < doc.lines.count; ++i)
+        if (doc_line_start(&doc, i) != (i < 2 ? i : i + 1)) goto done;
     ok = true;
 done:
     core_dispose(&saved);
@@ -182,10 +216,21 @@ static bool test_utf8(const wchar_t *unused)
   }
   for (unsigned col = 0; col <= 4; ++col)
     if (doc_line_byte_col_from_visual_col(&doc, 0, col) != boundaries[col]) failed++;
+  for (unsigned i = 0; i < _countof(boundaries); ++i)
+  {
+    u64 line, col;
+    const u64 columns[] = {0, 1, 2, 3, 4, 6, 7, 0};
+    doc_offset_to_line_col(&doc, boundaries[i], &line, &col);
+    if (line != (i == 7 ? 1 : 0) || col != columns[i] ||
+        doc.lines.scanned_to > boundaries[i]) failed++;
+  }
   for (unsigned i = 0; i < _countof(invalid); ++i)
     if (utf8_decode(invalid[i], 4, &cp) != 1 || cp != 0xfffd) failed++;
   if (utf8_decode((const unsigned char *)"\xf0\x9f\x98", 3, &cp) != 1 || cp != 0xfffd) failed++;
   doc_clear(&doc);
+  doc_discover_all_lines(&doc);
+  if (!doc.lines.eof || doc.lines.count != 1) failed++;
+  doc_dispose_contents(&doc);
   if (failed) fail("utf8", "decoding or viewport assertion failed");
   return failed == 0;
 }
