@@ -8,7 +8,7 @@ echo Stopping stale fast test process...
 taskkill /f /im text_fast_tests.exe >nul 2>nul
 
 echo Building fast backend test harness...
-"%~dp0cpc.exe" -o "%BUILD_DIR%\text_fast_tests.exe" "%~dp0text_fast_tests.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
+"%~dp0cpc.exe" -o "%BUILD_DIR%\text_fast_tests.exe" "%~dp0text_fast_tests.c" "%~dp0core\core.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
 if errorlevel 1 exit /b 1
 
 echo.

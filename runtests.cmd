@@ -12,7 +12,7 @@ copy /y "%~dp0doCommands.txt" "%BUILD_DIR%\doCommands.txt" >nul
 if errorlevel 1 exit /b 1
 
 echo Building application under test...
-"%~dp0cpc.exe" -o "%BUILD_DIR%\text_under_test.exe" "%~dp0main.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
+"%~dp0cpc.exe" -o "%BUILD_DIR%\text_under_test.exe" "%~dp0main.c" "%~dp0core\core.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
 if errorlevel 1 exit /b 1
 
 echo.

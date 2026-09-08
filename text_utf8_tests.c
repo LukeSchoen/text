@@ -24,7 +24,7 @@ int main(void)
     u64 off = doc.len;
     if (!doc_insert_bytes(&doc, off, pair, 2, NULL) || !doc_delete_range(&doc, off, 1)) return 2;
   }
-  if (doc.piece_count != sizeof(input) - 1) failed++;
+  if (core_pieces(&doc.rope) != sizeof(input) - 1) failed++;
   for (unsigned i = 0; i + 1 < _countof(boundaries); ++i)
   {
     if (doc_next_character(&doc, boundaries[i]) != boundaries[i + 1]) failed++;

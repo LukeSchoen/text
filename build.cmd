@@ -45,7 +45,7 @@ if "%CPC_LIB_OK%"=="" (
 
 if /i "%BUILD_MODE%"=="repro" goto build_repro
 
-"%~dp0cpc.exe" -o "%~dp0text.exe" "%~dp0main.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
+"%~dp0cpc.exe" -o "%~dp0text.exe" "%~dp0main.c" "%~dp0core\core.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
 if errorlevel 1 (
   echo Build failed.
   exit /b 1
@@ -65,7 +65,7 @@ set "REPRO_DIR=%~dp0.build\repro"
 if not exist "%REPRO_DIR%" mkdir "%REPRO_DIR%"
 
 echo Building repro executable...
-"%~dp0cpc.exe" -DREPRO_BUILD -o "%REPRO_DIR%\textRepro.exe" "%~dp0main.c" "%~dp0repro_logger.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
+"%~dp0cpc.exe" -DREPRO_BUILD -o "%REPRO_DIR%\textRepro.exe" "%~dp0main.c" "%~dp0core\core.c" "%~dp0repro_logger.c" -luser32 -lgdi32 -lcomdlg32 -lshell32 -luxtheme -ldwmapi -lmsimg32
 if errorlevel 1 (
   echo Repro build failed.
   exit /b 1

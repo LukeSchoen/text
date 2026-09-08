@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -19,6 +19,7 @@
 #include <wctype.h>
 #include <direct.h>
 #include "repro_logger.h"
+#include "core/core.h"
 
 /******************************************************************************
  * Core Types
@@ -46,7 +47,6 @@ typedef uint64_t u64;
 #define FILEWATCH_TIMER_ID 2
 #define FILEWATCH_TIMER_MS 1000
 #define LINECOUNT_ASYNC_FILE_BYTES (8u * 1024u * 1024u)
-#define ADD_BLOCK_DEFAULT (64u * 1024u)
 #define THEME_BG RGB(35, 31, 24)
 #define THEME_FG RGB(155, 155, 155)
 #define THEME_GUTTER_BG THEME_BG
@@ -95,27 +95,7 @@ typedef uint64_t u64;
  * Core Data Structures
  ******************************************************************************/
 
-typedef enum BackingKind
-{
-  BACKING_ORIGINAL,
-  BACKING_ADD
-} BackingKind;
 
-typedef struct Piece
-{
-  struct Piece *prev;
-  struct Piece *next;
-  const char *data;
-  u64 len;
-  BackingKind kind;
-} Piece;
-
-typedef struct AddBlock
-{
-  struct AddBlock *next;
-  char *data;
-  u64 len, cap;
-} AddBlock;
 
 typedef struct LineIndex
 {
@@ -175,9 +155,8 @@ typedef struct PreparedSave
 
 typedef struct Document
 {
-  Piece *head;
-  Piece *tail;
-  u64 len, piece_count;
+  Core rope;
+  u64 len;
   bool dirty;
   bool stamp_valid;
   bool disk_change_prompted;
@@ -189,8 +168,6 @@ typedef struct Document
   FileStamp stamp;
   FileStamp observed_stamp;
   MappedFile mf;
-  AddBlock *add_head;
-  AddBlock *add_tail;
   LineIndex lines;
 } Document;
 
@@ -267,12 +244,7 @@ typedef struct App
   bool skip_keep_caret_visible_once;
 } App;
 
-typedef struct SpanRef
-{
-  const char *data;
-  u64 len;
-  BackingKind kind;
-} SpanRef;
+typedef Core SpanRef;
 
 typedef enum UndoOpKind
 {
@@ -306,11 +278,7 @@ typedef struct UndoStack
   size_t cap;
 } UndoStack;
 
-typedef struct Resolve
-{
-  Piece *piece;
-  u64 local, base;
-} Resolve;
+
 
 /******************************************************************************
  * Global State
@@ -396,11 +364,9 @@ static bool doc_check_disk_state(Document *doc);
 
 static bool doc_insert_bytes(Document *doc, u64 off, const char *text, u64 n, const char **out_add_ptr);
 
-static bool doc_insert_span(Document *doc, u64 off, const char *data, u64 n, BackingKind kind);
 
 static bool doc_delete_range(Document *doc, u64 off, u64 n);
 
-static Resolve doc_resolve_offset(Document *doc, u64 off);
 
 /* App-facing edit operations. */
 static bool app_doc_insert(App *app, u64 off, const char *text, u64 n);
@@ -410,7 +376,7 @@ static bool app_doc_delete(App *app, u64 off, u64 n);
 /* Undo/history helpers. */
 static bool doc_capture_spans(Document *doc, u64 off, u64 len, SpanRef **out_spans, size_t *out_count);
 
-static bool txn_record_insert(u64 off, const char *data, u64 len);
+static bool txn_record_insert(Document *doc, u64 off, u64 len);
 
 static bool txn_record_delete(u64 off, u64 len, SpanRef *spans, size_t span_count);
 
@@ -627,7 +593,7 @@ static ULONGLONG monotonic_tick_ms(void)
 
 
 /******************************************************************************
- * Document Storage And Piece List
+ * Document Storage And Shared Rope
  ******************************************************************************/
 static void mapped_close(MappedFile *mf)
 {
@@ -939,7 +905,14 @@ static void line_index_invalidate_from(LineIndex *li, u64 off)
     li->eof = false;
     return;
   }
-  while (keep < li->count && line_index_start_at(li, keep) <= off) ++keep;
+  {
+    u64 hi = li->count;
+    while (keep < hi) {
+      u64 mid = keep + (hi - keep) / 2;
+      if (line_index_start_at(li, mid) <= off) keep = mid + 1;
+      else hi = mid;
+    }
+  }
   li->count = keep;
   {
     u64 keep_blocks = line_index_blocks_for_count(keep);
@@ -997,96 +970,23 @@ static void line_index_adjust_delete(LineIndex *li, u64 off, u64 n)
   }
 }
 
-static void piece_free_all(Document *doc)
+static void spans_free(SpanRef *spans, size_t count)
 {
-  Piece *p = doc->head;
-  while (p)
-  {
-    Piece *next = p->next;
-    free(p);
-    p = next;
-  }
-  doc->head = NULL;
-  doc->tail = NULL;
-  doc->piece_count = 0;
+  for (size_t i = 0; i < count; ++i) core_dispose(&spans[i]);
+  free(spans);
 }
 
-static void add_blocks_free(AddBlock *b)
+static void mapped_release(void *user, const void *data, uint64_t len)
 {
-  while (b)
-  {
-    AddBlock *next = b->next;
-    free(b->data);
-    free(b);
-    b = next;
-  }
-}
-
-static Piece *piece_new(const char *data, u64 len, BackingKind kind)
-{
-  Piece *p = (Piece *)calloc(1, sizeof(Piece));
-  if (!p) return NULL;
-  p->data = data;
-  p->len = len;
-  p->kind = kind;
-  return p;
-}
-
-static void piece_insert_before(Document *doc, Piece *before, Piece *p)
-{
-  if (!before)
-  {
-    p->prev = doc->tail;
-    p->next = NULL;
-    if (doc->tail) doc->tail->next = p; else doc->head = p;
-    doc->tail = p;
-  }
-  else
-  {
-    p->prev = before->prev;
-    p->next = before;
-    if (before->prev) before->prev->next = p; else doc->head = p;
-    before->prev = p;
-  }
-  doc->piece_count++;
-}
-
-static void piece_unlink_free(Document *doc, Piece *p)
-{
-  if (p->prev) p->prev->next = p->next; else doc->head = p->next;
-  if (p->next) p->next->prev = p->prev; else doc->tail = p->prev;
-  doc->piece_count--;
-  free(p);
-}
-
-static bool pieces_adjacent(Piece *a, Piece *b)
-{
-  return a && b && a->kind == b->kind && a->data + a->len == b->data;
-}
-
-static Piece *piece_coalesce_around(Document *doc, Piece *p)
-{
-  if (!p) return NULL;
-  if (pieces_adjacent(p->prev, p))
-  {
-    Piece *left = p->prev;
-    left->len += p->len;
-    piece_unlink_free(doc, p);
-    p = left;
-  }
-  if (pieces_adjacent(p, p->next))
-  {
-    Piece *right = p->next;
-    p->len += right->len;
-    piece_unlink_free(doc, right);
-  }
-  return p;
+  MappedFile *mf = (MappedFile *)user;
+  (void)data; (void)len;
+  mapped_close(mf);
+  free(mf);
 }
 
 static void doc_dispose_contents(Document *doc)
 {
-  piece_free_all(doc);
-  add_blocks_free(doc->add_head);
+  core_dispose(&doc->rope);
   mapped_close(&doc->mf);
   line_index_free(&doc->lines);
 }
@@ -1096,44 +996,6 @@ static void doc_clear(Document *doc)
   doc_dispose_contents(doc);
   memset(doc, 0, sizeof(*doc));
   doc_reset_lines(doc);
-}
-
-static AddBlock *add_block_new(u64 cap)
-{
-  AddBlock *b = (AddBlock *)calloc(1, sizeof(AddBlock));
-  if (!b) return NULL;
-  b->data = (char *)malloc((size_t)cap);
-  if (!b->data)
-  {
-    free(b);
-    return NULL;
-  }
-  b->cap = cap;
-  return b;
-}
-
-static bool doc_append_add_bytes(Document *doc, const char *src, u64 n, const char **out)
-{
-  if (n == 0)
-  {
-    *out = "";
-    return true;
-  }
-  AddBlock *b = doc->add_tail;
-  if (!b || b->cap - b->len < n)
-  {
-    u64 cap = max_u64(ADD_BLOCK_DEFAULT, n);
-    AddBlock *nb = add_block_new(cap);
-    if (!nb) return false;
-    if (doc->add_tail) doc->add_tail->next = nb; else doc->add_head = nb;
-    doc->add_tail = nb;
-    b = nb;
-  }
-  char *ptr = b->data + b->len;
-  memcpy(ptr, src, (size_t)n);
-  b->len += n;
-  *out = ptr;
-  return true;
 }
 
 static bool doc_set_empty(Document *doc)
@@ -1148,7 +1010,7 @@ static bool doc_load_mapped(Document *doc, const WCHAR *path)
   HANDLE f;
   LARGE_INTEGER sz;
   FileStamp stamp;
-  Piece *p;
+  MappedFile *owner;
   memset(&loaded, 0, sizeof(loaded));
   /* Retain this read lease with delete sharing for the mapped document's
      lifetime. Other readers and atomic ReplaceFile saves remain compatible,
@@ -1184,78 +1046,42 @@ static bool doc_load_mapped(Document *doc, const WCHAR *path)
       doc_dispose_contents(&loaded);
       return false;
     }
-    p = piece_new(loaded.mf.data, loaded.len, BACKING_ORIGINAL);
-    if (!p)
+    owner = (MappedFile *)malloc(sizeof(*owner));
+    if (!owner)
     {
       doc_dispose_contents(&loaded);
       return false;
     }
-    piece_insert_before(&loaded, NULL, p);
+    *owner = loaded.mf;
+    if (!core_from_memory(&loaded.rope, owner->data, loaded.len, mapped_release, owner))
+    {
+      free(owner);
+      doc_dispose_contents(&loaded);
+      return false;
+    }
+    memset(&loaded.mf, 0, sizeof(loaded.mf));
   }
+
   doc_reset_lines(&loaded);
   doc_dispose_contents(doc);
   *doc = loaded;
   return true;
 }
 
-static Resolve doc_resolve_offset(Document *doc, u64 off)
-{
-  Resolve r;
-  memset(&r, 0, sizeof(r));
-  if (off > doc->len) off = doc->len;
-  u64 base = 0;
-  for (Piece *p = doc->head; p; p = p->next)
-  {
-    u64 end = base + p->len;
-    if (off < end)
-    {
-      r.piece = p;
-      r.local = off - base;
-      r.base = base;
-      return r;
-    }
-    if (off == end && !p->next)
-    {
-      r.piece = p;
-      r.local = p->len;
-      r.base = base;
-      return r;
-    }
-    base = end;
-  }
-  r.base = doc->len;
-  return r;
-}
-
-static Piece *piece_split(Document *doc, Piece *p, u64 local)
-{
-  if (!p) return NULL;
-  if (local == 0) return p;
-  if (local >= p->len) return p->next;
-  Piece *right = piece_new(p->data + local, p->len - local, p->kind);
-  if (!right) return NULL;
-  p->len = local;
-  piece_insert_before(doc, p->next, right);
-  return right;
-}
-
 typedef void (*SpanFn)(const char *data, u64 len, void *user);
-
+typedef struct SpanAdapter { SpanFn fn; void *user; } SpanAdapter;
+static int doc_span_adapter(void *user, const char *data, uint64_t len)
+{
+  SpanAdapter *a = (SpanAdapter *)user;
+  a->fn(data, len, a->user);
+  return 1;
+}
 static void doc_read_range(Document *doc, u64 off, u64 len, SpanFn fn, void *user)
 {
+  SpanAdapter a = {fn, user};
   if (off >= doc->len || len == 0) return;
-  if (off + len > doc->len) len = doc->len - off;
-  Resolve r = doc_resolve_offset(doc, off);
-  Piece *p = r.piece;
-  u64 local = r.local;
-  while (p && len)
-  {
-    u64 take = min_u64(p->len - local, len);
-    if (take) fn(p->data + local, take, user);
-    len -= take;
-    p = p->next;
-    local = 0;
-  }
+  len = min_u64(len, doc->len - off);
+  core_runs(&doc->rope, off, len, doc_span_adapter, &a);
 }
 
 typedef struct CopyCtx
@@ -1284,27 +1110,7 @@ static void append_span(const char *data, u64 len, void *user)
   ctx->n += len;
 }
 
-static bool doc_range_has_newline(Document *doc, u64 off, u64 len)
-{
-  if (off >= doc->len || len == 0) return false;
-  if (off + len > doc->len) len = doc->len - off;
-  Resolve r = doc_resolve_offset(doc, off);
-  Piece *p = r.piece;
-  u64 local = r.local;
-  while (p && len)
-  {
-    u64 take = min_u64(p->len - local, len);
-    const char *s = p->data + local;
-    for (u64 i = 0; i < take; ++i)
-    {
-      if (s[i] == '\n' || s[i] == '\r') return true;
-    }
-    len -= take;
-    p = p->next;
-    local = 0;
-  }
-  return false;
-}
+
 
 static bool bytes_have_newline(const char *s, u64 n)
 {
@@ -1315,74 +1121,38 @@ static bool bytes_have_newline(const char *s, u64 n)
   return false;
 }
 
-/* Unsafe rope primitive: prefer app_doc_insert/app_doc_delete in editor flows. */
-static bool doc_insert_span(Document *doc, u64 off, const char *data, u64 n, BackingKind kind)
+static bool doc_insert_bytes(Document *doc, u64 off, const char *text, u64 n, const char **out_add_ptr)
 {
-  Resolve r;
-  Piece *right;
-  Piece *np;
+  CoreRun run;
   if (n == 0) return true;
   if (off > doc->len) off = doc->len;
-  r = doc_resolve_offset(doc, off);
-  right = r.piece ? piece_split(doc, r.piece, r.local) : NULL;
-  np = piece_new(data, n, kind);
-  if (!np) return false;
-  piece_insert_before(doc, right, np);
-  piece_coalesce_around(doc, np);
-  doc->len += n;
+  if (!core_insert(&doc->rope, off, text, n)) return false;
+  doc->len = core_len(&doc->rope);
   doc->dirty = true;
-  if (bytes_have_newline(data, n))
-  {
-    LineIndex *li = &doc->lines;
-    if (li->eof && off >= li->scanned_to)
-    {
-      for (u64 i = 0; i < n; ++i)
-      {
-        if (data[i] == '\n') line_index_push_start(li, off + i + 1);
-      }
-      li->scanned_to = doc->len;
-      li->eof = true;
-    }
-    else
-      line_index_invalidate_from(li, off);
+  if (out_add_ptr) {
+    core_run(&doc->rope, off, &run);
+    *out_add_ptr = run.data;
   }
+  if (n > 4096 || bytes_have_newline(text, n))
+    line_index_invalidate_from(&doc->lines, off);
   else
     line_index_adjust_insert(&doc->lines, off, n);
   return true;
 }
 
-static bool doc_insert_bytes(Document *doc, u64 off, const char *text, u64 n, const char **out_add_ptr)
-{
-  if (n == 0) return true;
-  if (off > doc->len) off = doc->len;
-  const char *add_ptr = NULL;
-  if (!doc_append_add_bytes(doc, text, n, &add_ptr)) return false;
-  if (!doc_insert_span(doc, off, add_ptr, n, BACKING_ADD)) return false;
-  if (out_add_ptr) *out_add_ptr = add_ptr;
-  return true;
-}
-
-/* Unsafe rope primitive: prefer app_doc_insert/app_doc_delete in editor flows. */
 static bool doc_delete_range(Document *doc, u64 off, u64 n)
 {
+  char small[4096];
+  bool touches_newline = true;
   if (off >= doc->len || n == 0) return true;
   n = min_u64(n, doc->len - off);
-  bool touches_newline = doc_range_has_newline(doc, off, n);
-  Resolve start = doc_resolve_offset(doc, off);
-  Piece *first = piece_split(doc, start.piece, start.local);
-  Resolve end = doc_resolve_offset(doc, off + n);
-  Piece *after = piece_split(doc, end.piece, end.local);
-  Piece *p = first;
-  while (p && p != after)
-  {
-    Piece *next = p->next;
-    piece_unlink_free(doc, p);
-    p = next;
+  if (n <= sizeof(small)) {
+    core_read(&doc->rope, off, n, small);
+    touches_newline = bytes_have_newline(small, n);
   }
-  doc->len -= n;
+  if (!core_replace(&doc->rope, off, n, NULL)) return false;
+  doc->len = core_len(&doc->rope);
   doc->dirty = true;
-  if (after) piece_coalesce_around(doc, after);
-  else if (doc->tail) piece_coalesce_around(doc, doc->tail);
   if (touches_newline) line_index_invalidate_from(&doc->lines, off);
   else line_index_adjust_delete(&doc->lines, off, n);
   return true;
@@ -1390,18 +1160,38 @@ static bool doc_delete_range(Document *doc, u64 off, u64 n)
 
 static bool app_doc_insert(App *app, u64 off, const char *text, u64 n)
 {
+  Core before = {0};
+  bool was_dirty = app->doc.dirty;
   const char *add_ptr = NULL;
-  if (!doc_insert_bytes(&app->doc, off, text, n, &add_ptr)) return false;
-  if (!txn_record_insert(off, add_ptr, n)) return false;
+  if (!n) return true;
+  off = min_u64(off, app->doc.len);
+  core_clone(&before, &app->doc.rope);
+  if (!doc_insert_bytes(&app->doc, off, text, n, &add_ptr)) {
+    core_dispose(&before);
+    return false;
+  }
+  if (!txn_record_insert(&app->doc, off, n)) {
+    core_clone(&app->doc.rope, &before);
+    app->doc.len = core_len(&before);
+    app->doc.dirty = was_dirty;
+    line_index_invalidate_from(&app->doc.lines, 0);
+    core_dispose(&before);
+    return false;
+  }
   repro_note_insert((unsigned long long)off, (unsigned long long)n, add_ptr ? add_ptr : text, (unsigned long long)n);
+  core_dispose(&before);
   return true;
 }
 
 static bool app_doc_delete(App *app, u64 off, u64 n)
 {
+  Core before = {0};
+  bool was_dirty = app->doc.dirty;
   SpanRef *spans = NULL;
   size_t span_count = 0;
   u64 del_len = 0;
+  char preview[32];
+  u64 preview_len = 0;
   if (off >= app->doc.len || n == 0) return true;
   del_len = min_u64(n, app->doc.len - off);
   if (g_txn_depth > 0 && !g_history_replaying)
@@ -1410,53 +1200,49 @@ static bool app_doc_delete(App *app, u64 off, u64 n)
   }
   if (spans && span_count > 0)
   {
-    char preview[32];
-    u64 preview_len = repro_collect_deleted_preview(spans, span_count, preview, (u64)sizeof(preview));
-    repro_note_delete((unsigned long long)off, (unsigned long long)del_len, preview, (unsigned long long)preview_len);
+    preview_len = repro_collect_deleted_preview(spans, span_count, preview, (u64)sizeof(preview));
   }
+  core_clone(&before, &app->doc.rope);
   if (!doc_delete_range(&app->doc, off, del_len))
   {
-    free(spans);
+    spans_free(spans, span_count);
+    core_dispose(&before);
     return false;
   }
-  if (!txn_record_delete(off, del_len, spans, span_count)) return false;
+  if (!txn_record_delete(off, del_len, spans, span_count)) {
+    core_clone(&app->doc.rope, &before);
+    app->doc.len = core_len(&before);
+    app->doc.dirty = was_dirty;
+    line_index_invalidate_from(&app->doc.lines, 0);
+    core_dispose(&before);
+    return false;
+  }
+  repro_note_delete((unsigned long long)off, (unsigned long long)del_len, preview, (unsigned long long)preview_len);
+  core_dispose(&before);
   return true;
 }
 
+static void flat_release(void *user, const void *data, uint64_t len)
+{
+  (void)user; (void)len;
+  free((void *)data);
+}
 static bool doc_flatten_to_one_add_piece(Document *doc)
 {
-  AddBlock *flat = add_block_new(doc->len ? doc->len : 1);
-  if (!flat) return false;
-  if (doc->len)
-  {
-    CopyCtx ctx = { flat->data, 0 };
-    doc_read_range(doc, 0, doc->len, copy_span, &ctx);
-    flat->len = doc->len;
-  }
-  Piece *new_piece = NULL;
-  if (doc->len)
-  {
-    new_piece = piece_new(flat->data, doc->len, BACKING_ADD);
-    if (!new_piece)
-    {
-      free(flat->data);
-      free(flat);
+  Core flat = {0};
+  char *data = NULL;
+  if (doc->len > SIZE_MAX) return false;
+  if (doc->len) {
+    data = (char *)malloc((size_t)doc->len);
+    if (!data) return false;
+    if (!core_read(&doc->rope, 0, doc->len, data) ||
+        !core_from_memory(&flat, data, doc->len, flat_release, NULL)) {
+      free(data);
       return false;
     }
   }
-  Piece *old_pieces = doc->head;
-  AddBlock *old_add = doc->add_head;
-  doc->head = doc->tail = NULL;
-  doc->piece_count = 0;
-  doc->add_head = doc->add_tail = flat;
-  if (new_piece) piece_insert_before(doc, NULL, new_piece);
-  while (old_pieces)
-  {
-    Piece *next = old_pieces->next;
-    free(old_pieces);
-    old_pieces = next;
-  }
-  add_blocks_free(old_add);
+  core_dispose(&doc->rope);
+  doc->rope = flat; /* transfer ownership */
   mapped_close(&doc->mf);
   doc_reset_lines(doc);
   return true;
@@ -1476,13 +1262,13 @@ static bool write_all(HANDLE f, const char *data, u64 len)
   return true;
 }
 
+static int write_rope_run(void *user, const char *data, uint64_t len)
+{
+  return write_all((HANDLE)user, data, len);
+}
 static bool doc_write_pieces(Document *doc, HANDLE f)
 {
-  for (Piece *p = doc->head; p; p = p->next)
-  {
-    if (!write_all(f, p->data, p->len)) return false;
-  }
-  return true;
+  return core_runs(&doc->rope, 0, doc->len, write_rope_run, f) != 0;
 }
 
 static bool make_save_temp_path(const WCHAR *path, WCHAR *out, size_t out_count)
@@ -1693,44 +1479,19 @@ static void scan_for_lines(Document *doc, u64 target)
 {
   LineIndex *li = &doc->lines;
   u64 budget = LINE_DISCOVERY_BUDGET;
-  u64 off = li->scanned_to;
-  Resolve r = doc_resolve_offset(doc, off);
-  Piece *p = r.piece;
-  u64 local = r.local;
-  while (!li->eof && li->count <= target && budget > 0)
-  {
-    if (!p)
-    {
-      li->scanned_to = doc->len;
-      li->eof = true;
-      break;
-    }
-    const char *s = p->data + local;
-    u64 avail = p->len - local;
-    while (avail && budget > 0)
-    {
+  while (!li->eof && li->count <= target && budget) {
+    CoreRun run;
+    core_run(&doc->rope, li->scanned_to, &run);
+    u64 take = min_u64(run.len, budget);
+    for (u64 i = 0; i < take; ++i) {
+      ++li->scanned_to;
       --budget;
-      ++off;
-      if (*s++ == '\n')
-      {
-        line_index_push_start(li, off);
+      if (run.data[i] == '\n') {
+        if (!line_index_push_start(li, li->scanned_to)) return;
         if (li->count > target) break;
       }
-      --avail;
     }
-    if (avail == 0)
-    {
-      p = p->next;
-      local = 0;
-    }
-    else
-      local = p->len - avail;
-    li->scanned_to = off;
-    if (off >= doc->len)
-    {
-      li->eof = true;
-      break;
-    }
+    li->eof = li->scanned_to == doc->len;
   }
 }
 
@@ -1764,22 +1525,14 @@ static u64 doc_line_start(Document *doc, u64 line)
 static u64 doc_line_length_clamped(Document *doc, u64 start, u64 limit)
 {
   if (start >= doc->len) return doc->len;
-  u64 end = min_u64(doc->len, start + limit);
-  Resolve r = doc_resolve_offset(doc, start);
-  Piece *p = r.piece;
-  u64 local = r.local;
-  u64 off = start;
-  while (p && off < end)
-  {
-    u64 take = min_u64(p->len - local, end - off);
-    const char *s = p->data + local;
+  u64 end = start + min_u64(limit, doc->len - start);
+  while (start < end) {
+    CoreRun run;
+    core_run(&doc->rope, start, &run);
+    u64 take = min_u64(run.len, end - start);
     for (u64 i = 0; i < take; ++i)
-    {
-      if (s[i] == '\r' || s[i] == '\n') return off + i;
-    }
-    off += take;
-    p = p->next;
-    local = 0;
+      if (run.data[i] == '\r' || run.data[i] == '\n') return start + i;
+    start += take;
   }
   return end;
 }
@@ -1811,27 +1564,27 @@ static unsigned utf8_decode(const unsigned char *s, unsigned n, uint32_t *cp)
 
 typedef struct Utf8Cursor
 {
-  Piece *piece;
-  u64 local, off, end;
+  Document *doc;
+  const char *data;
+  u64 available, off, end;
 } Utf8Cursor;
-
 static Utf8Cursor utf8_cursor(Document *doc, u64 off, u64 end)
 {
-  Resolve r = doc_resolve_offset(doc, off);
-  Utf8Cursor c = {r.piece, r.local, off, min_u64(end, doc->len)};
+  Utf8Cursor c = {doc, NULL, 0, off, min_u64(end, doc->len)};
   return c;
 }
-
 static unsigned utf8_cursor_byte(Utf8Cursor *c, unsigned char *out)
 {
-  while (c->piece && c->local >= c->piece->len)
-  {
-    c->piece = c->piece->next;
-    c->local = 0;
+  if (c->off >= c->end) return 0;
+  if (!c->available) {
+    CoreRun run;
+    if (!core_run(&c->doc->rope, c->off, &run) || !run.len) return 0;
+    c->data = run.data;
+    c->available = run.len;
   }
-  if (!c->piece || c->off >= c->end) return 0;
-  *out = (unsigned char)c->piece->data[c->local++];
-  c->off++;
+  *out = (unsigned char)*c->data++;
+  --c->available;
+  ++c->off;
   return 1;
 }
 
@@ -2003,7 +1756,7 @@ static void doc_offset_to_line_col(Document *doc, u64 off, u64 *out_line, u64 *o
 static void undo_op_free(UndoOp *op)
 {
   if (!op) return;
-  free(op->spans);
+  spans_free(op->spans, op->span_count);
   memset(op, 0, sizeof(*op));
 }
 
@@ -2100,104 +1853,36 @@ static void clear_history(void)
 
 static bool doc_capture_spans(Document *doc, u64 off, u64 len, SpanRef **out_spans, size_t *out_count)
 {
-  SpanRef *spans = NULL;
-  size_t count = 0;
-  size_t cap = 0;
-  if (off >= doc->len || len == 0)
-  {
-    *out_spans = NULL;
-    *out_count = 0;
-    return true;
-  }
-  if (off + len > doc->len) len = doc->len - off;
-  Resolve r = doc_resolve_offset(doc, off);
-  Piece *p = r.piece;
-  u64 local = r.local;
-  while (p && len)
-  {
-    u64 take = min_u64(p->len - local, len);
-    if (take)
-    {
-      if (count == cap)
-      {
-        size_t new_cap = cap ? cap * 2 : 8;
-        SpanRef *new_spans = (SpanRef *)realloc(spans, new_cap *sizeof(SpanRef));
-        if (!new_spans)
-        {
-          free(spans);
-          return false;
-        }
-        spans = new_spans;
-        cap = new_cap;
-      }
-      spans[count].data = p->data + local;
-      spans[count].len = take;
-      spans[count].kind = p->kind;
-      count++;
-    }
-    len -= take;
-    p = p->next;
-    local = 0;
-  }
-  *out_spans = spans;
-  *out_count = count;
+  SpanRef *spans;
+  *out_spans = NULL; *out_count = 0;
+  if (off >= doc->len || !len) return true;
+  len = min_u64(len, doc->len - off);
+  spans = (SpanRef *)calloc(1, sizeof(*spans));
+  if (!spans) return false;
+  if (!core_slice(spans, &doc->rope, off, len)) { free(spans); return false; }
+  *out_spans = spans; *out_count = 1;
   return true;
 }
 
-static bool txn_record_insert(u64 off, const char *data, u64 len)
+static bool txn_record_insert(Document *doc, u64 off, u64 len)
 {
-  UndoOp op;
-  SpanRef *spans;
-  if (g_history_replaying || g_txn_depth <= 0 || len == 0) return true;
-  spans = (SpanRef *)malloc(sizeof(SpanRef));
-  if (!spans) return false;
-  spans[0].data = data;
-  spans[0].len = len;
-  spans[0].kind = BACKING_ADD;
-  memset(&op, 0, sizeof(op));
-  op.kind = UNDO_OP_INSERT;
-  op.off = off;
-  op.len = len;
-  op.spans = spans;
-  op.span_count = 1;
-  if (!undo_txn_push_op(&g_txn, &op))
-  {
-    free(spans);
-    return false;
-  }
+  UndoOp op = {0};
+  if (g_history_replaying || g_txn_depth <= 0 || !len) return true;
+  op.kind = UNDO_OP_INSERT; op.off = off; op.len = len;
+  if (!doc_capture_spans(doc, off, len, &op.spans, &op.span_count)) return false;
+  if (!undo_txn_push_op(&g_txn, &op)) { undo_op_free(&op); return false; }
   return true;
 }
 
 static bool txn_record_delete(u64 off, u64 len, SpanRef *spans, size_t span_count)
 {
-  UndoOp op;
-  if (g_history_replaying || g_txn_depth <= 0 || len == 0)
-  {
-    free(spans);
-    return true;
+  UndoOp op = {0};
+  if (g_history_replaying || g_txn_depth <= 0 || !len) {
+    spans_free(spans, span_count); return true;
   }
-  memset(&op, 0, sizeof(op));
-  op.kind = UNDO_OP_DELETE;
-  op.off = off;
-  op.len = len;
-  op.spans = spans;
-  op.span_count = span_count;
-  if (!undo_txn_push_op(&g_txn, &op))
-  {
-    free(spans);
-    return false;
-  }
-  return true;
-}
-
-static bool doc_reinsert_spans(Document *doc, u64 off, const SpanRef *spans, size_t span_count)
-{
-  u64 at = off;
-  for (size_t i = 0; i < span_count; ++i)
-  {
-    if (!doc_insert_span(doc, at, spans[i].data, spans[i].len, spans[i].kind)) return false;
-    at += spans[i].len;
-  }
+  op.kind = UNDO_OP_DELETE; op.off = off; op.len = len;
+  op.spans = spans; op.span_count = span_count;
+  if (!undo_txn_push_op(&g_txn, &op)) { undo_op_free(&op); return false; }
   return true;
 }
 
@@ -2223,75 +1908,53 @@ static void apply_after_state(App *app, const UndoTxn *txn, bool after)
   request_repaint(app, FALSE);
 }
 
-static bool apply_txn_forward(App *app, const UndoTxn *txn)
+/* Build the entire replay privately, then commit once. Even a multi-operation
+   undo leaves both the document and history unchanged on allocation failure. */
+static bool replay_txn(App *app, const UndoTxn *txn, bool reverse)
 {
-  for (size_t i = 0; i < txn->count; ++i)
-  {
-    const UndoOp *op = &txn->ops[i];
-    if (op->kind == UNDO_OP_INSERT)
-    {
-      if (!doc_reinsert_spans(&app->doc, op->off, op->spans, op->span_count)) return false;
+  Core next = {0};
+  u64 first_changed = app->doc.len;
+  core_clone(&next, &app->doc.rope);
+  for (size_t i = 0; i < txn->count; ++i) {
+    const UndoOp *op = &txn->ops[reverse ? txn->count - 1 - i : i];
+    bool insert = (op->kind == UNDO_OP_INSERT) != reverse;
+    const Core *range = NULL;
+    if (insert) {
+      if (op->span_count != 1) { core_dispose(&next); return false; }
+      range = &op->spans[0];
     }
-    else
-    {
-      if (!doc_delete_range(&app->doc, op->off, op->len)) return false;
+    if (!core_replace(&next, op->off, insert ? 0 : op->len, range)) {
+      core_dispose(&next);
+      return false;
     }
+    first_changed = min_u64(first_changed, op->off);
   }
+  core_dispose(&app->doc.rope);
+  app->doc.rope = next; /* transfer ownership */
+  app->doc.len = core_len(&next);
+  line_index_invalidate_from(&app->doc.lines, first_changed);
   return true;
 }
 
-static bool apply_txn_reverse(App *app, const UndoTxn *txn)
+static void perform_history(App *app, bool reverse)
 {
-  for (size_t i = txn->count; i-- > 0;)
-  {
-    const UndoOp *op = &txn->ops[i];
-    if (op->kind == UNDO_OP_INSERT)
-    {
-      if (!doc_delete_range(&app->doc, op->off, op->len)) return false;
-    }
-    else
-    {
-      if (!doc_reinsert_spans(&app->doc, op->off, op->spans, op->span_count)) return false;
-    }
-  }
-  return true;
-}
-
-static void perform_undo(App *app)
-{
+  UndoStack *source = reverse ? &g_undo_stack : &g_redo_stack;
+  UndoStack *target = reverse ? &g_redo_stack : &g_undo_stack;
   if (g_txn_depth > 0) end_edit_txn(app);
-  if (g_undo_stack.count == 0) return;
-  UndoTxn txn = g_undo_stack.items[g_undo_stack.count - 1];
-  g_undo_stack.count--;
+  if (!source->count) return;
+  UndoTxn txn = source->items[source->count - 1];
+  /* Reserve the destination before editing; ownership moves only on success. */
+  if (!undo_stack_push(target, &txn)) return;
   g_history_replaying = true;
-  if (apply_txn_reverse(app, &txn))
-  {
-    apply_after_state(app, &txn, false);
-    if (!undo_stack_push(&g_redo_stack, &txn)) undo_txn_free(&txn);
-  }
-  else
-    undo_txn_free(&txn);
+  if (replay_txn(app, &txn, reverse)) {
+    --source->count;
+    apply_after_state(app, &txn, !reverse);
+  } else --target->count;
   g_history_replaying = false;
 }
 
-static void perform_redo(App *app)
-{
-  if (g_txn_depth > 0) end_edit_txn(app);
-  if (g_redo_stack.count == 0) return;
-  UndoTxn txn = g_redo_stack.items[g_redo_stack.count - 1];
-  g_redo_stack.count--;
-  g_history_replaying = true;
-  if (apply_txn_forward(app, &txn))
-  {
-    apply_after_state(app, &txn, true);
-    if (!undo_stack_push(&g_undo_stack, &txn)) undo_txn_free(&txn);
-  }
-  else
-    undo_txn_free(&txn);
-  g_history_replaying = false;
-}
-
-
+static void perform_undo(App *app) { perform_history(app, true); }
+static void perform_redo(App *app) { perform_history(app, false); }
 
 /******************************************************************************
  * Caret Utilities
@@ -2626,47 +2289,16 @@ static void update_scrollbars(App *app)
 static bool doc_discover_step(Document *doc, u64 budget)
 {
   LineIndex *li = &doc->lines;
-  u64 off;
-  Resolve r;
-  Piece *p;
-  u64 local;
-  if (li->eof || budget == 0) return li->eof;
-  off = li->scanned_to;
-  r = doc_resolve_offset(doc, off);
-  p = r.piece;
-  local = r.local;
-  while (budget > 0)
-  {
-    if (!p)
-    {
-      li->scanned_to = doc->len;
-      li->eof = true;
-      break;
+  while (!li->eof && budget) {
+    CoreRun run;
+    core_run(&doc->rope, li->scanned_to, &run);
+    u64 take = min_u64(run.len, budget);
+    for (u64 i = 0; i < take; ++i) {
+      ++li->scanned_to;
+      if (run.data[i] == '\n' && !line_index_push_start(li, li->scanned_to)) return false;
     }
-    {
-      const char *s = p->data + local;
-      u64 avail = p->len - local;
-      while (avail && budget > 0)
-      {
-        --budget;
-        ++off;
-        if (*s++ == '\n') line_index_push_start(li, off);
-        --avail;
-      }
-      if (avail == 0)
-      {
-        p = p->next;
-        local = 0;
-      }
-      else
-        local = p->len - avail;
-      li->scanned_to = off;
-      if (off >= doc->len)
-      {
-        li->eof = true;
-        break;
-      }
-    }
+    budget -= take;
+    li->eof = li->scanned_to == doc->len;
   }
   return li->eof;
 }
@@ -4797,8 +4429,8 @@ static u64 repro_collect_deleted_preview(const SpanRef *spans, size_t span_count
   if (!buf || cap == 0) return 0;
   for (i = 0; i < span_count && total < cap; ++i)
   {
-    u64 take = min_u64(spans[i].len, cap - total);
-    memcpy(buf + total, spans[i].data, (size_t)take);
+    u64 take = min_u64(core_len(&spans[i]), cap - total);
+    core_read(&spans[i], 0, take, buf + total);
     total += take;
   }
   return total;
