@@ -239,6 +239,7 @@ typedef struct App
   bool clm;
   bool lcp;
   bool suppress_tab_char_once;
+  WCHAR pending_high_surrogate;
   HWND cmd_hwnd;
   HWND cmd_edit;
   HWND cmd_list;
@@ -1783,6 +1784,105 @@ static u64 doc_line_length_clamped(Document *doc, u64 start, u64 limit)
   return end;
 }
 
+/* Decode one Unicode scalar. Invalid bytes remain individually addressable and
+   render as replacement characters; never consume an unrelated following byte. */
+static unsigned utf8_decode(const unsigned char *s, unsigned n, uint32_t *cp)
+{
+  unsigned need;
+  uint32_t value;
+  *cp = 0xfffd;
+  if (!n) return 0;
+  if (s[0] < 0x80) { *cp = s[0]; return 1; }
+  if (s[0] >= 0xc2 && s[0] <= 0xdf) { need = 2; value = s[0] & 31; }
+  else if (s[0] >= 0xe0 && s[0] <= 0xef) { need = 3; value = s[0] & 15; }
+  else if (s[0] >= 0xf0 && s[0] <= 0xf4) { need = 4; value = s[0] & 7; }
+  else return 1;
+  if (n < need) return 1;
+  for (unsigned i = 1; i < need; ++i)
+  {
+    if ((s[i] & 0xc0) != 0x80) return 1;
+    value = (value << 6) | (s[i] & 63);
+  }
+  if ((need == 3 && value < 0x800) || (need == 4 && value < 0x10000) ||
+      value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) return 1;
+  *cp = value;
+  return need;
+}
+
+typedef struct Utf8Cursor
+{
+  Piece *piece;
+  u64 local, off, end;
+} Utf8Cursor;
+
+static Utf8Cursor utf8_cursor(Document *doc, u64 off, u64 end)
+{
+  Resolve r = doc_resolve_offset(doc, off);
+  Utf8Cursor c = {r.piece, r.local, off, min_u64(end, doc->len)};
+  return c;
+}
+
+static unsigned utf8_cursor_byte(Utf8Cursor *c, unsigned char *out)
+{
+  while (c->piece && c->local >= c->piece->len)
+  {
+    c->piece = c->piece->next;
+    c->local = 0;
+  }
+  if (!c->piece || c->off >= c->end) return 0;
+  *out = (unsigned char)c->piece->data[c->local++];
+  c->off++;
+  return 1;
+}
+
+static unsigned utf8_cursor_next(Utf8Cursor *c, uint32_t *cp)
+{
+  unsigned char bytes[4];
+  Utf8Cursor look = *c;
+  unsigned count = utf8_cursor_byte(&look, bytes);
+  unsigned used;
+  if (!count) return 0;
+  if (bytes[0] < 0x80) { *cp = bytes[0]; *c = look; return 1; }
+  while (count < 4 && utf8_cursor_byte(&look, bytes + count)) count++;
+  used = utf8_decode(bytes, count, cp);
+  for (unsigned i = 0; i < used; ++i) utf8_cursor_byte(c, bytes);
+  return used;
+}
+
+static u64 doc_next_character(Document *doc, u64 off)
+{
+  Utf8Cursor c = utf8_cursor(doc, off, doc->len);
+  uint32_t cp;
+  utf8_cursor_next(&c, &cp);
+  return c.off;
+}
+
+static u64 doc_previous_character(Document *doc, u64 off)
+{
+  unsigned char bytes[4];
+  u64 start = off > 4 ? off - 4 : 0;
+  CopyCtx ctx = {(char *)bytes, 0};
+  uint32_t cp;
+  if (!off) return 0;
+  doc_read_range(doc, start, off - start, copy_span, &ctx);
+  for (unsigned i = 0; i < ctx.at; ++i)
+    if (utf8_decode(bytes + i, (unsigned)ctx.at - i, &cp) == ctx.at - i)
+      return start + i;
+  return off - 1;
+}
+
+static u64 utf8_text_columns(const char *text, u64 len)
+{
+  u64 cols = 0, off = 0;
+  while (off < len)
+  {
+    uint32_t cp;
+    off += utf8_decode((const unsigned char *)text + off, (unsigned)min_u64(4, len - off), &cp);
+    cols += cp == '\t' ? TAB_WIDTH : 1;
+  }
+  return cols;
+}
+
 static u64 visual_advance_for_byte(unsigned char c, u64 visual_col)
 {
   (void)visual_col;
@@ -1792,31 +1892,15 @@ static u64 visual_advance_for_byte(unsigned char c, u64 visual_col)
 
 static u64 doc_line_visual_width(Document *doc, u64 start, u64 end)
 {
-  u64 visual_col = 0;
-  Resolve r;
-  Piece *p;
-  u64 local;
-  u64 off;
-  if (start >= end) return 0;
-  r = doc_resolve_offset(doc, start);
-  p = r.piece;
-  local = r.local;
-  off = start;
-  while (p && off < end)
+  u64 col = 0;
+  Utf8Cursor c = utf8_cursor(doc, start, end);
+  uint32_t cp;
+  while (utf8_cursor_next(&c, &cp))
   {
-    u64 take = min_u64(p->len - local, end - off);
-    const char *s = p->data + local;
-    for (u64 i = 0; i < take; ++i)
-    {
-      unsigned char c = (unsigned char)s[i];
-      if (c == '\r' || c == '\n') return visual_col;
-      visual_col += visual_advance_for_byte(c, visual_col);
-    }
-    off += take;
-    p = p->next;
-    local = 0;
+    if (cp == '\r' || cp == '\n') break;
+    col += cp == '\t' ? TAB_WIDTH : 1;
   }
-  return visual_col;
+  return col;
 }
 
 static u64 doc_line_visual_col_from_byte_col(Document *doc, u64 line, u64 byte_col)
@@ -1831,30 +1915,20 @@ static u64 doc_line_visual_col_from_byte_col(Document *doc, u64 line, u64 byte_c
 static u64 doc_line_byte_col_from_visual_col(Document *doc, u64 line, u64 visual_col)
 {
   u64 start = doc_line_start(doc, line);
-  u64 end = doc_line_length_clamped(doc, start, UINT32_MAX);
-  u64 byte_col = 0;
-  u64 cur_visual = 0;
-  while (start + byte_col < end)
+  u64 col = 0;
+  Utf8Cursor c = utf8_cursor(doc, start, doc->len);
+  while (col < visual_col)
   {
-    unsigned char c = 0;
-    u64 next_visual;
-    if (!doc_get_byte(doc, start + byte_col, &c)) break;
-    next_visual = cur_visual + visual_advance_for_byte(c, cur_visual);
-    if (visual_col < next_visual)
-    {
-      if (c == '\t')
-      {
-        u64 before_dist = visual_col > cur_visual ? visual_col - cur_visual : 0;
-        u64 after_dist = next_visual > visual_col ? next_visual - visual_col : 0;
-        return byte_col + (after_dist <= before_dist ? 1 : 0);
-      }
-      return byte_col;
-    }
-    if (visual_col == next_visual) return byte_col + 1;
-    cur_visual = next_visual;
-    ++byte_col;
+    u64 before = c.off;
+    uint32_t cp;
+    if (!utf8_cursor_next(&c, &cp)) break;
+    if (cp == '\r' || cp == '\n') return before - start;
+    u64 width = cp == '\t' ? TAB_WIDTH : 1;
+    if (col + width > visual_col && visual_col - col < col + width - visual_col)
+      return before - start;
+    col += width;
   }
-  return byte_col;
+  return c.off - start;
 }
 
 static u64 doc_line_col_clamped(Document *doc, u64 line, u64 col)
@@ -2257,53 +2331,42 @@ static void ensure_caret_shape(App *app)
 /******************************************************************************
  * Rendering
  ******************************************************************************/
-typedef struct VisibleCtx
+/* One scalar per editor grid cell; UTF-16 pairs are formed only at GDI output. */
+static int line_to_wide_visible(Document *doc, u64 start, u64 end, u64 fc, int max_cols, uint32_t *out)
 {
-  u64 skip;
-  u64 col;
-  WCHAR *out;
-  int n;
-  int max;
-} VisibleCtx;
-
-static void visible_span(const char *data, u64 len, void *user)
-{
-  VisibleCtx *ctx = (VisibleCtx *)user;
-  for (u64 i = 0; i < len && ctx->n < ctx->max; ++i)
+  Utf8Cursor c = utf8_cursor(doc, start, end);
+  u64 col = 0;
+  int n = 0;
+  uint32_t cp;
+  while (n < max_cols && utf8_cursor_next(&c, &cp))
   {
-    unsigned char c = (unsigned char)data[i];
-    u64 width;
-    u64 next_col;
-    u64 emit_from;
-    u64 emit_count;
-    if (c == '\r' || c == '\n') break;
-    width = visual_advance_for_byte(c, ctx->col);
-    next_col = ctx->col + width;
-    if (next_col <= ctx->skip)
-    {
-      ctx->col = next_col;
-      continue;
-    }
-    emit_from = ctx->skip > ctx->col ? ctx->skip : ctx->col;
-    emit_count = next_col - emit_from;
-    if (c == '\t')
-    {
-      while (emit_count-- > 0 && ctx->n < ctx->max) ctx->out[ctx->n++] = L' ';
-    }
-    else if (c < 32)
-      ctx->out[ctx->n++] = L' ';
-    else
-      ctx->out[ctx->n++] = (WCHAR)c;
-    ctx->col = next_col;
+    if (cp == '\r' || cp == '\n') break;
+    unsigned width = cp == '\t' ? TAB_WIDTH : 1;
+    for (unsigned i = 0; i < width; ++i, ++col)
+      if (col >= fc && n < max_cols) out[n++] = cp < 32 ? ' ' : cp;
   }
+  return n;
 }
 
-static int line_to_wide_visible(Document *doc, u64 start, u64 end, u64 fc, int max_cols, WCHAR *out)
+static void draw_text_cells(HDC dc, int x, int y, const uint32_t *cells, int n, int char_w)
 {
-  if (start >= end) return 0;
-  VisibleCtx ctx = { fc, 0, out, 0, max_cols };
-  doc_read_range(doc, start, end - start, visible_span, &ctx);
-  return ctx.n;
+  WCHAR text[MAX_PAINT_COLS * 2];
+  int advances[MAX_PAINT_COLS * 2];
+  int count = 0;
+  for (int i = 0; i < n; ++i)
+  {
+    uint32_t cp = cells[i];
+    if (cp > 0xffff)
+    {
+      cp -= 0x10000;
+      text[count] = (WCHAR)(0xd800 + (cp >> 10));
+      advances[count++] = 0;
+      text[count] = (WCHAR)(0xdc00 + (cp & 1023));
+    }
+    else text[count] = (WCHAR)cp;
+    advances[count++] = char_w;
+  }
+  ExtTextOutW(dc, x, y, 0, NULL, text, count, advances);
 }
 
 static void paint_editor(App *app, HDC dc)
@@ -2320,7 +2383,7 @@ static void paint_editor(App *app, HDC dc)
   SetBkMode(dc, TRANSPARENT);
   int max_cols = app->cols + 2;
   if (max_cols > MAX_PAINT_COLS - 1) max_cols = MAX_PAINT_COLS - 1;
-  WCHAR text_buf[MAX_PAINT_COLS];
+  uint32_t text_buf[MAX_PAINT_COLS];
   WCHAR num_buf[32];
   int text_left = app->gutter_w + EDIT_TEXT_LEFT_PADDING;
   HBRUSH active_line_brush = CreateSolidBrush(THEME_GUTTER_ACTIVE_LINE_BG);
@@ -2362,7 +2425,7 @@ static void paint_editor(App *app, HDC dc)
       }
       int n = line_to_wide_visible(&app->doc, start, end, app->fc, max_cols, text_buf);
       SetTextColor(dc, THEME_TEXT);
-      if (n > 0) TextOutW(dc, text_left, y, text_buf, n);
+      if (n > 0) draw_text_cells(dc, text_left, y, text_buf, n, app->char_w);
       if (has_stream_selection(app))
       {
         u64 sel_start = min_u64(app->sa, app->sv);
@@ -2388,7 +2451,7 @@ static void paint_editor(App *app, HDC dc)
               sel_rc.bottom = y + app->line_h;
               FillRect(dc, &sel_rc, selection_brush);
               SetTextColor(dc, THEME_SELECTION_TEXT);
-              TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, vis_end - vis_start);
+              draw_text_cells(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, vis_end - vis_start, app->char_w);
               SetTextColor(dc, THEME_TEXT);
             }
           }
@@ -2423,7 +2486,7 @@ static void paint_editor(App *app, HDC dc)
                 if (text_vis_end > vis_start)
                 {
                   SetTextColor(dc, THEME_SELECTION_TEXT);
-                  TextOutW(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, text_vis_end - vis_start);
+                  draw_text_cells(dc, text_left + vis_start *app->char_w, y, text_buf + vis_start, text_vis_end - vis_start, app->char_w);
                   SetTextColor(dc, THEME_TEXT);
                 }
               }
@@ -3020,9 +3083,9 @@ static bool apply_basic_edit(App *app, const char *insert_text, u64 insert_len, 
   {
     update_title(app);
     doc_ensure_line(&app->doc, bottom);
-    app->bac = left + insert_len;
-    app->bcc = left + insert_len;
-    app->bdc = left + insert_len;
+    app->bac = left + utf8_text_columns(insert_text, insert_len);
+    app->bcc = left + utf8_text_columns(insert_text, insert_len);
+    app->bdc = left + utf8_text_columns(insert_text, insert_len);
     set_caret_line_col(app, app->bcl, app->bdc);
   }
   end_edit_txn(app);
@@ -3116,8 +3179,8 @@ static bool apply_box_paste_multiline(App *app, const char *insert_text, u64 ins
     if (active_seg >= seg_count) active_seg = seg_count - 1;
     update_title(app);
     doc_ensure_line(&app->doc, bottom);
-    app->bac = left + seg_lens[0];
-    app->bcc = left + seg_lens[active_seg];
+    app->bac = left + utf8_text_columns(seg_ptrs[0], seg_lens[0]);
+    app->bcc = left + utf8_text_columns(seg_ptrs[active_seg], seg_lens[active_seg]);
     app->bdc = app->bcc;
     set_caret_line_col(app, app->bcl, app->bdc);
   }
@@ -4276,8 +4339,8 @@ static void handle_key(App *app, WPARAM vk)
     {
       begin_edit_txn(app);
       u64 off = app->co;
-      u64 del_start = off - 1;
-      u64 del = 1;
+      u64 del_start = doc_previous_character(&app->doc, off);
+      u64 del = off - del_start;
       if (app->cc == 0 && app->cl > 0)
       {
         u64 prev_start = doc_line_start(&app->doc, app->cl - 1);
@@ -4332,7 +4395,7 @@ static void handle_key(App *app, WPARAM vk)
     if (off < app->doc.len)
     {
       begin_edit_txn(app);
-      u64 del = 1;
+      u64 del = doc_next_character(&app->doc, off) - off;
       char c[2] = {0, 0};
       CopyCtx ctx = { c, 0 };
       doc_read_range(&app->doc, off, min_u64(2, app->doc.len - off), copy_span, &ctx);
@@ -4362,6 +4425,7 @@ static void handle_key(App *app, WPARAM vk)
 static void handle_char(App *app, WPARAM ch)
 {
   app->vsb = false;
+  if (ch < 32) app->pending_high_surrogate = 0;
   if (ch == L'\t' && app->suppress_tab_char_once)
   {
     app->suppress_tab_char_once = false;
@@ -4384,7 +4448,20 @@ static void handle_char(App *app, WPARAM ch)
   else if (ch >= 32 && ch != 127)
   {
     WCHAR w[2] = {(WCHAR)ch, 0};
-    n = WideCharToMultiByte(CP_UTF8, 0, w, 1, bytes, (int)sizeof(bytes), NULL, NULL);
+    int count = 1;
+    if (ch >= 0xd800 && ch <= 0xdbff)
+    {
+      app->pending_high_surrogate = (WCHAR)ch;
+      return;
+    }
+    if (ch >= 0xdc00 && ch <= 0xdfff && app->pending_high_surrogate)
+    {
+      w[0] = app->pending_high_surrogate;
+      w[1] = (WCHAR)ch;
+      count = 2;
+    }
+    app->pending_high_surrogate = 0;
+    n = WideCharToMultiByte(CP_UTF8, 0, w, count, bytes, (int)sizeof(bytes), NULL, NULL);
   }
   if (n > 0)
   {
@@ -4406,7 +4483,7 @@ static void handle_char(App *app, WPARAM ch)
         app->cc = 0;
       }
       else
-        app->cc += (u64)n;
+        app->cc += ch == L'\t' ? 2 : 1;
       update_title(app);
       clear_stream_selection(app);
       keep_visible_and_repaint(app);
@@ -5886,7 +5963,7 @@ static void move_caret_left(App *app)
 {
   if (app->co > 0)
   {
-    app->co--;
+    app->co = doc_previous_character(&app->doc, app->co);
     sync_caret_from_offsets(app);
   }
   else if (app->cl > 0)
@@ -5905,7 +5982,7 @@ static void move_caret_right(App *app)
   u64 end = doc_line_length_clamped(&app->doc, start, UINT32_MAX);
   if (app->co < end)
   {
-    app->co++;
+    app->co = doc_next_character(&app->doc, app->co);
     sync_caret_from_offsets(app);
   }
   else
@@ -6335,6 +6412,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     position_caret(app);
     return 0;
   case WM_KILLFOCUS:
+    app->pending_high_surrogate = 0;
     HideCaret(hwnd);
     DestroyCaret();
     app->ch = 0;
@@ -6381,6 +6459,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return 0;
   }
   case WM_KEYDOWN:
+    if (wp != VK_PACKET) app->pending_high_surrogate = 0;
     repro_begin_app_event(app, "key", (unsigned long)wp, (unsigned long)lp);
     handle_key(app, wp);
     repro_end_app_event(app);
@@ -6614,6 +6693,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return 0;
   }
   case WM_LBUTTONDOWN:
+    app->pending_high_surrogate = 0;
   {
     repro_begin_app_event(app, "ldown", (unsigned long)GET_X_LPARAM(lp), (unsigned long)GET_Y_LPARAM(lp));
     app->vsb = false;

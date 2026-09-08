@@ -40,4 +40,6 @@ call "%~dp0runtests.cmd" ^
   duplicate_open_clean_peer_reloads_after_save ^
   duplicate_open_dirty_peer_requires_explicit_overwrite ^
   deleted_file_keeps_editor_copy_until_explicit_recreate
+if errorlevel 1 exit /b %errorlevel%
+call "%~dp0RunTests_Utf8.cmd"
 exit /b %errorlevel%
